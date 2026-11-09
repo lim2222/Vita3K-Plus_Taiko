@@ -122,7 +122,13 @@ AudioOutPortPtr SDLAudioAdapter::open_port(int nb_channels, int freq, int nb_sam
     port->channels = nb_channels;
     port->len_microseconds = (nb_sample * 1'000'000ULL) / freq;
     port->len_bytes = nb_sample * nb_channels * sizeof(int16_t);
-    switch_state(false);
+    // Only make sure the device is running here. Do not call switch_state(): the
+    // guest allocates the port while holding state.mutex, and switch_state(false)
+    // takes that same mutex to wake the feed threads, which would self-deadlock
+    // this thread inside sceAudioOutOpenPort. The session resume path already
+    // clears the pause flag and wakes the parked feed threads.
+    if (!paused.load(std::memory_order_relaxed))
+        SDL_CHECK(SDL_ResumeAudioDevice(device_id));
     return port;
 }
 
