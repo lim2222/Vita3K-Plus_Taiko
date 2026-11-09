@@ -230,7 +230,12 @@ bool ScreenRenderer::setup() {
 
     create_render_pass();
 
-    create_swapchain();
+    try {
+        create_swapchain();
+    } catch (const vk::SystemError &error) {
+        LOG_ERROR("Could not create the swapchain: {}", error.what());
+        return false;
+    }
 
     // these functions do not need to be called when the swapchain is resized
     create_surface_image();
@@ -252,6 +257,9 @@ void ScreenRenderer::create_swapchain() {
         extent.height = std::clamp<uint32_t>(static_cast<uint32_t>(frame_host->drawable_height()), surface_capabilities.minImageExtent.height, surface_capabilities.maxImageExtent.height);
     }
 
+    confirmed_window_size = vk::Extent2D{};
+    swapchain_surface_extent = surface_capabilities.currentExtent;
+    surface_check_countdown = 15;
     if (extent.width == 0 || extent.height == 0)
         return;
 
@@ -274,6 +282,7 @@ void ScreenRenderer::create_swapchain() {
         swapchain_has_storage = surface_format.format == vk::Format::eR8G8B8A8Unorm
             // workaround for a Turnip driver bug: adding storage flag here breaks the swapchain
             && !state.is_adreno_turnip
+            && !swapchain_storage_refused
             && static_cast<bool>(surface_capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eStorage)
             && static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eStorageImage);
         if (swapchain_has_storage)
@@ -310,7 +319,23 @@ void ScreenRenderer::create_swapchain() {
             .clipped = true,
         };
 
-        swapchain = state.device.createSwapchainKHR(swapchain_info);
+        try {
+            swapchain = state.device.createSwapchainKHR(swapchain_info);
+        } catch (const vk::SystemError &error) {
+            if (!swapchain_has_storage)
+                throw;
+            LOG_WARN("The driver refused a swapchain with storage usage ({}); trying again without it, FSR will blit its output", error.what());
+            swapchain_storage_refused = true;
+#ifdef __ANDROID__
+            const bool new_surface = true;
+#else
+            const bool new_surface = error.code() == vk::Result::eErrorSurfaceLostKHR;
+#endif
+            if (new_surface && !create())
+                throw;
+            create_swapchain();
+            return;
+        }
     }
 
     // Get Swapchain Images
@@ -377,7 +402,7 @@ void ScreenRenderer::destroy_swapchain() {
 }
 
 void ScreenRenderer::cleanup() {
-    state.device.waitIdle();
+    state.wait_gpu_idle();
 
     filter.reset();
 
@@ -411,13 +436,12 @@ void ScreenRenderer::cleanup() {
     state.device.destroy(swapchain);
     swapchain = nullptr;
 
-    for (uint32_t i = 0; i <= swapchain_size; i++) {
-        if (i != swapchain_size)
-            state.device.destroy(fences[i]);
-
-        state.device.destroy(image_acquired_semaphores[i]);
-        state.device.destroy(image_ready_semaphores[i]);
-    }
+    for (vk::Fence fence : fences)
+        state.device.destroy(fence);
+    for (vk::Semaphore semaphore : image_acquired_semaphores)
+        state.device.destroy(semaphore);
+    for (vk::Semaphore semaphore : image_ready_semaphores)
+        state.device.destroy(semaphore);
     fences.clear();
     image_acquired_semaphores.clear();
     image_ready_semaphores.clear();
@@ -735,10 +759,19 @@ bool ScreenRenderer::ensure_swapchain() {
         return false;
 
     if (!need_rebuild && !need_surface_recreate && swapchain) {
-        // A one-frame disagreement between what Vulkan reports as the surface extent and what the window reports as its client size is not a resize
-        if (!note_size_mismatch(!surface_matches_window_size()))
-            return true;
-        rebuild_reason = "persistent window size mismatch";
+#ifdef __ANDROID__
+        const bool surface_changed = android_surface_changed();
+#else
+        constexpr bool surface_changed = false;
+#endif
+        if (surface_changed) {
+            rebuild_reason = "surface resized";
+        } else {
+            // A one-frame disagreement between what Vulkan reports as the surface extent and what the window reports as its client size is not a resize
+            if (!note_size_mismatch(!surface_matches_window_size()))
+                return true;
+            rebuild_reason = "persistent window size mismatch";
+        }
     }
 
     if (!rebuild_swapchain_if_visible()) {
@@ -805,8 +838,42 @@ bool ScreenRenderer::surface_matches_window_size() {
     if (frame_host->drawable_width() == 0 || frame_host->drawable_height() == 0)
         return true;
 
-    return extent.width == static_cast<uint32_t>(frame_host->drawable_width())
-        && extent.height == static_cast<uint32_t>(frame_host->drawable_height());
+    const vk::Extent2D window_size{ static_cast<uint32_t>(frame_host->drawable_width()), static_cast<uint32_t>(frame_host->drawable_height()) };
+    if (window_size == extent || window_size == confirmed_window_size)
+        return true;
+
+    // Qt's scaled window size can differ from the window's real size (fractional scaling on Linux)
+    // and the surface extent is the one the swapchain has to match
+    vk::Extent2D surface_extent{};
+    try {
+        surface_extent = state.physical_device.getSurfaceCapabilitiesKHR(surface).currentExtent;
+    } catch (const vk::SystemError &) {
+        return false;
+    }
+    if (surface_extent.width == std::numeric_limits<uint32_t>::max() || surface_extent != extent)
+        return false;
+#ifdef __ANDROID__
+    // a window of the other orientation is a rotation the swapchain has not followed (it's never a scaling difference)
+    if ((window_size.width > window_size.height) != (extent.width > extent.height))
+        return false;
+#endif
+
+    confirmed_window_size = window_size;
+    return true;
 }
+
+#ifdef __ANDROID__
+bool ScreenRenderer::android_surface_changed() {
+    if (--surface_check_countdown > 0)
+        return false;
+    surface_check_countdown = 15;
+
+    try {
+        return state.physical_device.getSurfaceCapabilitiesKHR(surface).currentExtent != swapchain_surface_extent;
+    } catch (const vk::SystemError &) {
+        return false;
+    }
+}
+#endif
 
 } // namespace renderer::vulkan

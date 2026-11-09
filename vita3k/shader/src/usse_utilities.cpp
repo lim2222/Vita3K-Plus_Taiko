@@ -16,6 +16,7 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <shader/spirv_recompiler.h>
+#include <shader/uniform_block.h>
 #include <shader/usse_constant_table.h>
 #include <shader/usse_program_analyzer.h>
 #include <shader/usse_utilities.h>
@@ -26,6 +27,7 @@
 #include <SPIRV/GLSL.std.450.h>
 #include <features/state.h>
 
+#include <atomic>
 #include <bitset>
 
 namespace shader::usse::utils {
@@ -473,7 +475,7 @@ static spv::Function *make_f16_unpack_func(spv::Builder &b, const SpirvUtilFunct
     return f16_unpack_func;
 }
 
-static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctions &utils, const FeatureState &features) {
+static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctions &utils, const FeatureState &features, const bool keep_denormals) {
     std::vector<std::vector<spv::Decoration>> decorations;
 
     spv::Block *f16_pack_func_block;
@@ -483,12 +485,14 @@ static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctio
     spv::Id type_f32 = b.makeFloatType(32);
     spv::Id type_f32_v2 = b.makeVectorType(type_f32, 2);
 
+    const char *const name = keep_denormals ? "pack2xF16KeepDenormals" : "pack2xF16";
     spv::Function *f16_pack_func = b.makeFunctionEntry(
-        spv::NoPrecision, type_f32, "pack2xF16", spv::LinkageTypeMax, { type_f32_v2 },
+        spv::NoPrecision, type_f32, name, spv::LinkageTypeMax, { type_f32_v2 },
         decorations, &f16_pack_func_block);
-    b.setupFunctionDebugInfo(f16_pack_func, "pack2xF16", { type_f32_v2 }, { "to_pack" });
+    b.setupFunctionDebugInfo(f16_pack_func, name, { type_f32_v2 }, { "to_pack" });
 
-    f16_pack_func->addParamPrecision(0, spv::DecorationRelaxedPrecision);
+    if (!keep_denormals)
+        f16_pack_func->addParamPrecision(0, spv::DecorationRelaxedPrecision);
     spv::Id extracted = f16_pack_func->getParamId(0);
 
     // saturate rather than overflow to Inf
@@ -500,8 +504,34 @@ static spv::Function *make_f16_pack_func(spv::Builder &b, const SpirvUtilFunctio
     extracted = b.createTriOp(spv::OpSelect, type_f32_v2, is_nan, extracted, saturated);
 
     // use packHalf2x16
-    extracted = b.createBuiltinCall(type_ui32, utils.std_builtins, GLSLstd450PackHalf2x16, { extracted });
-    extracted = b.createUnaryOp(spv::OpBitcast, type_f32, extracted);
+    spv::Id packed = b.createBuiltinCall(type_ui32, utils.std_builtins, GLSLstd450PackHalf2x16, { extracted });
+
+    if (keep_denormals) {
+        // packHalf2x16 flushes halves below 2^-14 to zero here, so build those as sign | roundEven(|x| * 2^24) in fp32
+        const spv::Id type_ui32_v2 = b.makeVectorType(type_ui32, 2);
+        const spv::Id type_bool = b.makeBoolType();
+        const spv::Id min_normal = b.makeFloatConstant(6.103515625e-05f);
+        const spv::Id min_normal_v2 = b.makeCompositeConstant(type_f32_v2, { min_normal, min_normal });
+        const spv::Id magnitude = b.createBuiltinCall(type_f32_v2, utils.std_builtins, GLSLstd450FAbs, { extracted });
+        const spv::Id is_subnormal = b.createBinOp(spv::OpFOrdLessThan, b.makeVectorType(type_bool, 2), magnitude, min_normal_v2);
+        const spv::Id two_pow_24 = b.makeFloatConstant(16777216.0f);
+        spv::Id subnormal = b.createBuiltinCall(type_f32_v2, utils.std_builtins, GLSLstd450FMin, { magnitude, min_normal_v2 });
+        subnormal = b.createBinOp(spv::OpFMul, type_f32_v2, subnormal, b.makeCompositeConstant(type_f32_v2, { two_pow_24, two_pow_24 }));
+        subnormal = b.createBuiltinCall(type_f32_v2, utils.std_builtins, GLSLstd450RoundEven, { subnormal });
+        subnormal = b.createUnaryOp(spv::OpConvertFToU, type_ui32_v2, subnormal);
+        spv::Id sign = b.createUnaryOp(spv::OpBitcast, type_ui32_v2, extracted);
+        sign = b.createBinOp(spv::OpShiftRightLogical, type_ui32_v2, sign, b.makeCompositeConstant(type_ui32_v2, { b.makeUintConstant(16), b.makeUintConstant(16) }));
+        sign = b.createBinOp(spv::OpBitwiseAnd, type_ui32_v2, sign, b.makeCompositeConstant(type_ui32_v2, { b.makeUintConstant(0x8000), b.makeUintConstant(0x8000) }));
+        subnormal = b.createBinOp(spv::OpBitwiseOr, type_ui32_v2, subnormal, sign);
+
+        const spv::Id low = b.createTriOp(spv::OpSelect, type_ui32, b.createCompositeExtract(is_subnormal, type_bool, 0),
+            b.createCompositeExtract(subnormal, type_ui32, 0), b.createBinOp(spv::OpBitwiseAnd, type_ui32, packed, b.makeUintConstant(0xFFFF)));
+        const spv::Id high = b.createTriOp(spv::OpSelect, type_ui32, b.createCompositeExtract(is_subnormal, type_bool, 1),
+            b.createCompositeExtract(subnormal, type_ui32, 1), b.createBinOp(spv::OpShiftRightLogical, type_ui32, packed, b.makeUintConstant(16)));
+        packed = b.createBinOp(spv::OpBitwiseOr, type_ui32, low, b.createBinOp(spv::OpShiftLeftLogical, type_ui32, high, b.makeUintConstant(16)));
+    }
+
+    extracted = b.createUnaryOp(spv::OpBitcast, type_f32, packed);
 
     b.makeReturn(false, extracted);
     b.setBuildPoint(last_build_point);
@@ -657,7 +687,55 @@ static spv::Id make_or_get_buffer_ptr(spv::Builder &b, shader::usse::utils::Spir
     return utils.buffer_address_vec[buffer_utils_idx][is_write];
 }
 
+static void record_vertex_stores(spv::Builder &b, SpirvUtilFunctions &utils, spv::Id address, uint32_t offset, spv::Id data) {
+    const spv::Id u32 = b.makeUintType(32);
+    const spv::Id scalar_type = b.getScalarTypeId(b.getTypeId(data));
+    const int count = static_cast<int>(b.getNumComponents(data));
+    for (int i = 0; i < count; i++, utils.vertex_store_count++) {
+        if (utils.vertex_store_count >= utils.vertex_store_capacity)
+            continue;
+        spv::Id value = (count == 1) ? data : b.createCompositeExtract(data, scalar_type, i);
+        if (scalar_type != u32)
+            value = b.createUnaryOp(spv::OpBitcast, u32, value);
+        const spv::Id target = add_uvec2_uint(b, address, b.makeUintConstant(offset + i * 4));
+        const spv::Id slot = b.createCompositeConstruct(b.makeVectorType(u32, 4), { b.createCompositeExtract(target, u32, 0), b.createCompositeExtract(target, u32, 1), value, b.makeUintConstant(1) });
+        b.createStore(slot, create_access_chain(b, spv::StorageClassOutput, utils.vertex_stores, { b.makeIntConstant(utils.vertex_store_count) }));
+    }
+    if (utils.loop_depth > 0)
+        utils.vertex_store_in_loop = true;
+}
+
+static spv::Id holds_guest_pixel_centre(spv::Builder &b, const SpirvShaderParameters &params, const SpirvUtilFunctions &utils) {
+    const spv::Id f32 = b.makeFloatType(32);
+    const spv::Id bool_type = b.makeBoolType();
+    spv::Id res_multiplier = create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_res_multiplier) });
+    res_multiplier = b.createLoad(res_multiplier, spv::NoPrecision);
+    const spv::Id frag_coord = b.createLoad(params.frag_coord_id, spv::NoPrecision);
+    const auto centred = [&](const int comp) {
+        const spv::Id coord = b.createCompositeExtract(frag_coord, f32, comp);
+        const spv::Id host = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Floor, { coord });
+        const spv::Id guest = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Floor, { b.createBinOp(spv::OpFDiv, f32, coord, res_multiplier) });
+        const spv::Id centre = b.createBinOp(spv::OpFMul, f32, b.createBinOp(spv::OpFAdd, f32, guest, b.makeFloatConstant(0.5f)), res_multiplier);
+        return b.createBinOp(spv::OpFOrdEqual, bool_type, host, b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Floor, { centre }));
+    };
+    return b.createBinOp(spv::OpLogicalAnd, bool_type, centred(0), centred(1));
+}
+
 void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, int dest_offset, spv::Id addr, uint32_t component_size, uint32_t nb_components, int buffer_idx, bool is_buffer_store) {
+    if (is_buffer_store && utils.drop_buffer_stores)
+        return;
+    const spv::Id store_condition = (is_buffer_store && buffer_stores_at_guest_pixel_centre && params.frag_coord_id != spv::NoResult && utils.vertex_stores == spv::NoResult)
+        ? holds_guest_pixel_centre(b, params, utils)
+        : spv::NoResult;
+    const auto store_to_buffer = [&](const spv::Id data, const spv::Id pointer) {
+        if (store_condition == spv::NoResult) {
+            b.createStore(data, pointer, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
+            return;
+        }
+        spv::Builder::If centre(store_condition, spv::SelectionControlMaskNone, b);
+        b.createStore(data, pointer, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
+        centre.makeEndIf();
+    };
     const spv::Id i32 = b.makeIntType(32);
     const spv::Id u32 = b.makeUintType(32);
     const spv::Id zero = b.makeIntConstant(0);
@@ -710,7 +788,10 @@ void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params,
 
                 if (is_buffer_store) {
                     spv::Id data = load(b, params, utils, features, dest, 0b1111, dest_offset);
-                    b.createStore(data, accessed, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
+                    if (utils.vertex_stores != spv::NoResult)
+                        record_vertex_stores(b, utils, buffer_address, buffer_idx_vec4 * 16, data);
+                    else
+                        store_to_buffer(data, accessed);
                 } else {
                     accessed = b.createLoad(accessed, spv::NoPrecision, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
                     store(b, params, utils, features, dest, accessed, 0b1111, dest_offset);
@@ -732,7 +813,10 @@ void buffer_address_access(spv::Builder &b, const SpirvShaderParameters &params,
 
             if (is_buffer_store) {
                 spv::Id data = load(b, params, utils, features, dest, (1 << nb_components) - 1, dest_offset);
-                b.createStore(data, accessed, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
+                if (utils.vertex_stores != spv::NoResult)
+                    record_vertex_stores(b, utils, buffer_address, buffer_idx_vec4 * 16, data);
+                else
+                    store_to_buffer(data, accessed);
             } else {
                 accessed = b.createLoad(accessed, spv::NoPrecision, spv::MemoryAccessAlignedMask, spv::ScopeMax, 4);
                 store(b, params, utils, features, dest, accessed, (1 << nb_components) - 1, dest_offset);
@@ -840,9 +924,14 @@ spv::Id pack_one(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState 
         return b.createFunctionCall(utils.pack_fx10, { vec });
     }
     case DataType::F16: {
+        if (utils.keep_f16_denormals) {
+            if (!utils.pack_f16_keep_denormals)
+                utils.pack_f16_keep_denormals = make_f16_pack_func(b, utils, features, true);
+            return b.createFunctionCall(utils.pack_f16_keep_denormals, { vec });
+        }
         auto iter = utils.pack_funcs.find(source_type);
         if (iter == utils.pack_funcs.end()) {
-            iter = utils.pack_funcs.emplace(source_type, make_f16_pack_func(b, utils, features)).first;
+            iter = utils.pack_funcs.emplace(source_type, make_f16_pack_func(b, utils, features, false)).first;
         }
         return b.createFunctionCall(iter->second, { vec });
     }
@@ -896,6 +985,73 @@ static spv::Id apply_modifiers(spv::Builder &b, const SpirvUtilFunctions &utils,
     return result;
 }
 
+static spv::Id load_tile_pixel_register(spv::Builder &b, const SpirvShaderParameters &params, const SpirvUtilFunctions &utils, const Operand &op, const Imm4 dest_mask) {
+    const spv::Id f32 = b.makeFloatType(32);
+    const spv::Id u32 = b.makeUintType(32);
+    const spv::Id i32 = b.makeIntType(32);
+
+    spv::Id res_multiplier = create_access_chain(b, spv::StorageClassUniform, params.render_info_id, { b.makeIntConstant(FRAG_UNIFORM_res_multiplier) });
+    res_multiplier = b.createLoad(res_multiplier, spv::NoPrecision);
+    const spv::Id frag_coord = b.createLoad(params.frag_coord_id, spv::NoPrecision);
+    const auto guest_coord = [&](const int comp) {
+        spv::Id coord = b.createBinOp(spv::OpFDiv, f32, b.createCompositeExtract(frag_coord, f32, comp), res_multiplier);
+        coord = b.createBuiltinCall(f32, utils.std_builtins, GLSLstd450Floor, { coord });
+        return b.createUnaryOp(spv::OpConvertFToU, u32, coord);
+    };
+    const spv::Id x = guest_coord(0);
+    const spv::Id y = guest_coord(1);
+
+    spv::Id word;
+    if (op.num == GLOBAL_REG_TILE_XY) {
+        // (coord >> 5) * 2 in one byte each
+        const auto tile = [&](const spv::Id coord) {
+            return b.createBinOp(spv::OpBitwiseAnd, u32, b.createBinOp(spv::OpShiftRightLogical, u32, coord, b.makeUintConstant(4)), b.makeUintConstant(0xFE));
+        };
+        word = b.createBinOp(spv::OpBitwiseOr, u32, tile(x), b.createBinOp(spv::OpShiftLeftLogical, u32, tile(y), b.makeUintConstant(8)));
+    } else {
+        word = b.createBinOp(spv::OpBitwiseAnd, u32, op.num == GLOBAL_REG_PIXEL_X ? x : y, b.makeUintConstant(31));
+    }
+
+    // the components the swizzle picks, from the register's 8 or 16-bit lanes like any other register
+    const bool is_signed = is_signed_integer_data_type(op.type);
+    const bool is_float = is_float_data_type(op.type);
+    const uint32_t lane_bits = (op.type == DataType::UINT8 || op.type == DataType::INT8) ? 8
+                                                                                         : ((op.type == DataType::UINT16 || op.type == DataType::INT16 || op.type == DataType::F16) ? 16 : 32);
+    const spv::Id comp_type = is_float ? f32 : (is_signed ? i32 : u32);
+    const auto constant = [&](const float value) {
+        return is_float ? b.makeFloatConstant(value) : (is_signed ? b.makeIntConstant(static_cast<int>(value)) : b.makeUintConstant(static_cast<uint32_t>(value)));
+    };
+    std::vector<spv::Id> comps;
+    for (int i = 0; i < 4; i++) {
+        if (!(dest_mask & (1 << i)))
+            continue;
+        const SwizzleChannel channel = op.swizzle[i];
+        if (channel >= SwizzleChannel::C_0) {
+            comps.push_back(constant(channel == SwizzleChannel::C_1 ? 1.0f : (channel == SwizzleChannel::C_2 ? 2.0f : (channel == SwizzleChannel::C_H ? 0.5f : 0.0f))));
+            continue;
+        }
+        const uint32_t lane = static_cast<uint32_t>(channel) - static_cast<uint32_t>(SwizzleChannel::C_X);
+        if (lane * lane_bits >= 32) {
+            comps.push_back(constant(0.0f));
+            continue;
+        }
+        spv::Id value = word;
+        if (op.type == DataType::F16) {
+            value = b.createBuiltinCall(b.makeVectorType(f32, 2), utils.std_builtins, GLSLstd450UnpackHalf2x16, { value });
+            value = b.createCompositeExtract(value, f32, lane);
+        } else if (lane_bits < 32) {
+            value = is_signed ? b.createTriOp(spv::OpBitFieldSExtract, i32, b.createUnaryOp(spv::OpBitcast, i32, value), b.makeUintConstant(lane * lane_bits), b.makeUintConstant(lane_bits))
+                              : b.createTriOp(spv::OpBitFieldUExtract, u32, value, b.makeUintConstant(lane * lane_bits), b.makeUintConstant(lane_bits));
+        } else if (comp_type != u32) {
+            value = b.createUnaryOp(spv::OpBitcast, comp_type, value);
+        }
+        comps.push_back(value);
+    }
+    if (comps.size() == 1)
+        return comps[0];
+    return b.createCompositeConstruct(b.makeVectorType(comp_type, static_cast<int>(comps.size())), comps);
+}
+
 spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand op, const Imm4 dest_mask, int shift_offset) {
     spv::Id type_f32 = b.makeFloatType(32);
 
@@ -920,7 +1076,13 @@ spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunc
             return apply_modifiers(b, utils, op.flags, flag);
         }
 
-        LOG_WARN_ONCE("Unhandled USSE global register g{} read as zero", op.num);
+        if (emulate_tile_pixel_registers && params.frag_coord_id != 0 && (op.num == GLOBAL_REG_PIXEL_X || op.num == GLOBAL_REG_PIXEL_Y || op.num == GLOBAL_REG_TILE_XY))
+            return apply_modifiers(b, utils, op.flags, load_tile_pixel_register(b, params, utils, op, dest_mask));
+
+        static std::atomic<uint64_t> warned_globals{ 0 };
+        const uint64_t bit = 1ull << (op.num & 63);
+        if (!(warned_globals.fetch_or(bit) & bit))
+            LOG_WARN("Unhandled USSE global register g{} read as zero", op.num);
     }
 
     if (op.bank == RegisterBank::FPCONSTANT) {
@@ -1330,7 +1492,7 @@ spv::Id unpack(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState &f
 }
 
 void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest,
-    spv::Id source, std::uint8_t dest_mask, int off, bool raw_move, bool raw_move_keeps_declared) {
+    spv::Id source, std::uint8_t dest_mask, int off, bool raw_move, bool raw_move_keeps_declared, bool raw_f16_lanes) {
     if (source == spv::NoResult) {
         LOG_WARN("Source invalid");
         return;
@@ -1339,6 +1501,9 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
     // Which layout the colour output holds is decided by the program's last write to it and a raw move keeps its source words
     if (params.frag_output_holds_declared_type != 0 && dest.bank == RegisterBank::OUTPUT)
         b.createStore(b.makeBoolConstant(raw_move ? raw_move_keeps_declared : is_float_data_type(dest.type)), params.frag_output_holds_declared_type);
+
+    if (raw_f16_lanes)
+        dest.type = DataType::UINT16;
 
     // Check for INDEX bank. INDEX bank are optimized to store an integer
     if (dest.bank == RegisterBank::INDEX || dest.bank == RegisterBank::PREDICATE) {
@@ -1355,14 +1520,10 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
                 source = b.createOp(spv::OpBitcast, b.makeIntType(32), ops);
             }
 
-            // if dest is a 8 or 16 bits integer
-            // Todo: keep the content of the upper bits of idx (not done right now)
-            if (!is_float_data_type(dest.type) && get_data_type_size(dest.type) < 4) {
-                spv::Id mask = (get_data_type_size(dest.type) == 1)
-                    ? b.makeIntConstant(0xFF)
-                    : b.makeIntConstant(0xFFFF);
-                source = b.createBinOp(spv::OpBitwiseAnd, b.makeIntType(32), source, mask);
-            }
+            // index registers are 16 bits wide (a wider write keeps its low half)
+            // Todo: an 8-bit write should keep the upper byte of idx (not done right now)
+            const bool byte_write = !is_float_data_type(dest.type) && get_data_type_size(dest.type) == 1;
+            source = b.createBinOp(spv::OpBitwiseAnd, b.makeIntType(32), source, b.makeIntConstant(byte_write ? 0xFF : 0xFFFF));
         }
 
         spv::Id var = b.createOp(spv::OpAccessChain, b.makePointer(spv::StorageClassPrivate, b.getContainedTypeId(b.getContainedTypeId(b.getTypeId(bank_base)))), { bank_base, b.makeIntConstant(dest.num) });
@@ -1442,7 +1603,7 @@ void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFuncti
         spv::Id vec_comp_type = utils::unwrap_type(b, b.getTypeId(source));
         int source_value_taken_count = 0;
         int last_swizz_on = 4;
-        if (dest.type == DataType::F16) {
+        if (dest.type == DataType::F16 || raw_f16_lanes) {
             if (!dest_mask)
                 return;
             while (!(dest_mask & (1 << (last_swizz_on - 1))))

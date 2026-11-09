@@ -349,7 +349,7 @@ fun SettingsRoute(
                 isPerApp = isPerApp,
                 backendRenderer = viewModel.config.backendRenderer,
                 showCustomDriverOptions = viewModel.showCustomDriverOptions,
-                showTurboModeOption = viewModel.showCustomDriverOptions
+                showTurboModeOption = viewModel.showTurboModeOption
             )
 
             Box(
@@ -714,7 +714,7 @@ private fun SettingsContentPane(
                 onRequestRemoveCustomDriver = onRequestRemoveCustomDriver,
                 isPerApp = isPerApp,
                 showCustomDriverManagement = viewModel.showCustomDriverOptions,
-                showTurboModeOption = viewModel.showCustomDriverOptions,
+                showTurboModeOption = viewModel.showTurboModeOption,
                 onClearAllCustomConfigs = onClearAllCustomConfigs,
                 onSelectCustomDriver = viewModel::selectCustomDriver,
                 onUpdate = viewModel::update,

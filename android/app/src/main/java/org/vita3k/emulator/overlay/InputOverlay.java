@@ -81,6 +81,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   private InputOverlayDrawableTatacon mTataconBeingConfigured;
   private float mScale = 1.0f;
   private int mOpacity = 100;
+  private boolean mTouchSwitchTilt = false;
   private OverlayLayout mLayout;
   private OverlayLayout mPortraitLayout;
   private OverlayLayout mLandscapeLayout;
@@ -247,6 +248,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   public void setState(int overlay_mask){
     if(mOverlayMask != overlay_mask){
       mOverlayMask = overlay_mask;
+      releaseInactiveInputs();
       invalidate();
     }
 
@@ -305,6 +307,99 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     }
 
     invalidate();
+  }
+
+  private void releaseButton(InputOverlayDrawableButton button)
+  {
+    int legacyId = button.getLegacyId();
+    button.setPressedState(false);
+    if (legacyId != ButtonType.BUTTON_TOUCH_SWITCH && legacyId != ButtonType.BUTTON_TOUCH_HIDE)
+      setButton(button.getControl(), false);
+    button.setTrackId(-1);
+  }
+
+  private void releaseDpad(InputOverlayDrawableDpad dpad)
+  {
+    for (int i = 0; i < 4; i++)
+      setButton(dpad.getControl(i), false);
+    dpad.setState(InputOverlayDrawableDpad.STATE_DEFAULT);
+    dpad.setTrackId(-1);
+  }
+
+  private void releaseJoystick(InputOverlayDrawableJoystick joystick)
+  {
+    setAxis(joystick.getXControl(), (short)0);
+    setAxis(joystick.getYControl(), (short)0);
+    joystick.release();
+  }
+
+  private void releaseTrackedInputs(int pointerId)
+  {
+    boolean released = false;
+    for (InputOverlayDrawableButton button : overlayButtons)
+    {
+      if (button.getTrackId() != -1 && (pointerId == -1 || button.getTrackId() == pointerId))
+      {
+        releaseButton(button);
+        released = true;
+      }
+    }
+    for (InputOverlayDrawableDpad dpad : overlayDpads)
+    {
+      if (dpad.getTrackId() != -1 && (pointerId == -1 || dpad.getTrackId() == pointerId))
+      {
+        releaseDpad(dpad);
+        released = true;
+      }
+    }
+    for (InputOverlayDrawableJoystick joystick : overlayJoysticks)
+    {
+      if (joystick.getTrackId() != -1 && (pointerId == -1 || joystick.getTrackId() == pointerId))
+      {
+        releaseJoystick(joystick);
+        released = true;
+      }
+    }
+    if (released)
+      invalidate();
+  }
+
+  private void releaseInactiveInputs()
+  {
+    final boolean processing = mOverlayMask != 0 && (mAllowVirtualController || isInEditMode());
+    boolean released = false;
+    for (InputOverlayDrawableButton button : overlayButtons)
+    {
+      final int role = button.getRole();
+      final boolean active = processing && (role & mOverlayMask) != 0
+              && (!mHideOverlayButtons || (role & OVERLAY_MASK_UTILITY) != 0);
+      if (!active && button.getTrackId() != -1)
+      {
+        releaseButton(button);
+        released = true;
+      }
+    }
+    if (!processing || mHideOverlayButtons)
+    {
+      for (InputOverlayDrawableDpad dpad : overlayDpads)
+      {
+        if (dpad.getTrackId() != -1)
+        {
+          releaseDpad(dpad);
+          released = true;
+        }
+      }
+      for (InputOverlayDrawableJoystick joystick : overlayJoysticks)
+      {
+        if (joystick.getTrackId() != -1)
+        {
+          releaseJoystick(joystick);
+          released = true;
+        }
+      }
+    }
+    if (released)
+      invalidate();
   }
 
   public void draw(Canvas canvas)
@@ -369,6 +464,17 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   @Override
   public boolean onTouch(View v, MotionEvent event)
   {
+    final int actionMasked = event.getActionMasked();
+    if (actionMasked == MotionEvent.ACTION_CANCEL)
+    {
+      releaseAllInputs();
+      return false;
+    }
+    if (actionMasked == MotionEvent.ACTION_DOWN)
+      releaseTrackedInputs(-1);
+    else if (actionMasked == MotionEvent.ACTION_POINTER_DOWN)
+      releaseTrackedInputs(event.getPointerId(event.getActionIndex()));
+
     if (mOverlayMask == 0)
       return false;
 
@@ -386,6 +492,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     int pointerIndex = firstPointer ? 0 : event.getActionIndex();
     // track if the overlay is concerned this this action
     boolean concerned = false;
+    boolean hideToggled = false;
 
 
 
@@ -418,7 +525,10 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
             if (legacyId == ButtonType.BUTTON_TOUCH_SWITCH)
               setTouchState(button.getTouchSwitchState());
             else if (legacyId == ButtonType.BUTTON_TOUCH_HIDE)
+            {
               mHideOverlayButtons = !mHideOverlayButtons;
+              hideToggled = true;
+            }
             else
               setButton(button.getControl(), true);
 
@@ -579,6 +689,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
           break;
       }
     }
+    if (hideToggled)
+      releaseInactiveInputs();
 
     if (concerned)
       invalidate();
@@ -845,9 +957,12 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
             R.drawable.button_r3_pressed, ButtonType.TRIGGER_R3,
             ControlId.r3, OVERLAY_MASK_L3R3, layout, layoutBounds, mScale, mOpacity, isPortrait));
 
-    overlayButtons.add(initializeOverlayButton(getContext(), R.drawable.button_touch_f,
+    final InputOverlayDrawableButton touchSwitch = initializeOverlayButton(getContext(), R.drawable.button_touch_f,
             R.drawable.button_touch_b, ButtonType.BUTTON_TOUCH_SWITCH,
-            ControlId.touch, OVERLAY_MASK_TOUCH_SCREEN_SWITCH, layout, layoutBounds, mScale, mOpacity, isPortrait));
+            ControlId.touch, OVERLAY_MASK_TOUCH_SCREEN_SWITCH, layout, layoutBounds, mScale, mOpacity, isPortrait);
+    if (mTouchSwitchTilt)
+      touchSwitch.setTiltStateBitmap(getResources(), BitmapFactory.decodeResource(getResources(), R.drawable.button_touch_t));
+    overlayButtons.add(touchSwitch);
 
     // show hide button
     overlayButtons.add(initializeOverlayButton(getContext(), R.drawable.button_hide,
@@ -877,6 +992,11 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
   public void refreshControls()
   {
+    int touchSwitchState = 0;
+    for (InputOverlayDrawableButton button : overlayButtons)
+      if (button.getLegacyId() == ButtonType.BUTTON_TOUCH_SWITCH)
+        touchSwitchState = button.getTouchSwitchState();
+
     // Remove all the overlay buttons from the HashSet.
     overlayButtons.clear();
     overlayDpads.clear();
@@ -885,6 +1005,16 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
     LayoutBounds layoutBounds = resolveLayoutBounds();
     addVitaOverlayControls(layoutBounds, getCurrentLayout(), isPortraitMode());
+
+    for (InputOverlayDrawableButton button : overlayButtons)
+    {
+      if (button.getLegacyId() != ButtonType.BUTTON_TOUCH_SWITCH)
+        continue;
+      final int restored = touchSwitchState < button.getTouchSwitchStateCount() ? touchSwitchState : 0;
+      button.setTouchSwitchState(restored);
+      if (restored != touchSwitchState)
+        setTouchState(restored);
+    }
 
     invalidate();
   }
@@ -1262,6 +1392,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       return;
 
     mAllowVirtualController = allowVirtualController;
+    releaseInactiveInputs();
     updateVirtualControllerState();
   }
 
@@ -1396,9 +1527,11 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 	mOverlayConfig = normalizedConfig;
     float resolvedScale = normalizedConfig.overlayScale / 100f;
 	int resolvedOpacity = normalizedConfig.overlayOpacity;
+    boolean resolvedTouchSwitchTilt = normalizedConfig.touchSwitchTilt;
     boolean changed = !normalizedLayout.equals(mLayout)
             || Float.compare(mScale, resolvedScale) != 0
-            || mOpacity != resolvedOpacity;
+            || mOpacity != resolvedOpacity
+            || mTouchSwitchTilt != resolvedTouchSwitchTilt;
 
     // Initialize both portrait and landscape layouts from the normalized layout
     mPortraitLayout = OverlayLayout.createFromJavaMaps(normalizedLayout.getPortraitPositionsJava(), Collections.emptyMap());
@@ -1407,6 +1540,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
     mScale = resolvedScale;
     mOpacity = resolvedOpacity;
+    mTouchSwitchTilt = resolvedTouchSwitchTilt;
 
     if (refresh && changed)
       refreshControls();

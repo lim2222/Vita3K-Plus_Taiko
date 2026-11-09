@@ -29,6 +29,8 @@
 #include <util/align.h>
 #include <util/string_utils.h>
 
+#include <atomic>
+
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceSysmem);
 
@@ -155,8 +157,10 @@ EXPORT(int, sceKernelFreeMemBlock, SceUID uid) {
 
 EXPORT(int, sceKernelFreeMemBlockForVM, SceUID uid) {
     TRACY_FUNC(sceKernelFreeMemBlockForVM, uid);
-    if (emuenv.renderer && renderer::has_dormant_mappings())
+    if (emuenv.renderer && renderer::has_dormant_mappings()) {
+        guest_sched_release_for_block();
         renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryUnmapFlush, true, static_cast<uint32_t>(thread_id));
+    }
 
     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
     const auto guard = std::lock_guard<std::mutex>(state->mutex);
@@ -248,12 +252,20 @@ EXPORT(int, sceKernelGetMemBlockInfoByRange) {
 
 EXPORT(int, sceKernelGetModel) {
     TRACY_FUNC(sceKernelGetModel);
-    return emuenv.cfg.current_config.pstv_mode ? SCE_KERNEL_MODEL_VITATV : SCE_KERNEL_MODEL_VITA;
+    const int model = emuenv.cfg.current_config.pstv_mode ? SCE_KERNEL_MODEL_VITATV : SCE_KERNEL_MODEL_VITA;
+    static std::atomic<int> logged{ 0 };
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+        LOG_INFO("sceKernelGetModel: 0x{:X} ({})", model, model == SCE_KERNEL_MODEL_VITATV ? "PS TV" : "PS Vita");
+    return model;
 }
 
 EXPORT(int, sceKernelGetModelForCDialog) {
     TRACY_FUNC(sceKernelGetModelForCDialog);
-    return emuenv.cfg.current_config.pstv_mode ? SCE_KERNEL_MODEL_VITATV : SCE_KERNEL_MODEL_VITA;
+    const int model = emuenv.cfg.current_config.pstv_mode ? SCE_KERNEL_MODEL_VITATV : SCE_KERNEL_MODEL_VITA;
+    static std::atomic<int> logged{ 0 };
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+        LOG_INFO("sceKernelGetModelForCDialog: 0x{:X} ({})", model, model == SCE_KERNEL_MODEL_VITATV ? "PS TV" : "PS Vita");
+    return model;
 }
 
 EXPORT(int, sceKernelGetSubbudgetInfo) {
@@ -263,6 +275,9 @@ EXPORT(int, sceKernelGetSubbudgetInfo) {
 
 EXPORT(bool, sceKernelIsPSVitaTV) {
     TRACY_FUNC(sceKernelIsPSVitaTV);
+    static std::atomic<int> logged{ 0 };
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+        LOG_INFO("sceKernelIsPSVitaTV: {}", emuenv.cfg.current_config.pstv_mode ? "yes (PS TV mode on)" : "no (PS TV mode off)");
     return emuenv.cfg.current_config.pstv_mode;
 }
 

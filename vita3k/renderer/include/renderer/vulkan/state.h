@@ -137,6 +137,7 @@ struct VKState : public renderer::State {
 
     // queue where we put requests that need to wait for the GPU
     Queue<WaitThreadRequest> request_queue;
+    std::thread gpu_request_wait_thread;
 
     vkutil::Image default_image;
     vkutil::Image default_raw_image;
@@ -146,6 +147,8 @@ struct VKState : public renderer::State {
     // support for the VK_KHR_uniform_buffer_standard_layout extension, needed for memory mapping and texture viewport
     bool support_standard_layout = false;
     bool support_rasterized_order_access = false;
+    // VK_EXT_pipeline_creation_cache_control (a pipeline can be requested from the driver cache without compiling it)
+    bool support_pipeline_cache_control = false;
     bool is_mesa_turnip = false;
     // Turnip Adreno 6xx fix: a draw that switches pipeline waits for the draws before it
     bool wait_on_pipeline_switch = false;
@@ -156,6 +159,10 @@ struct VKState : public renderer::State {
 #ifdef __ANDROID__
     bool support_android_buffer_import = false;
     bool support_unix_fd_import = false;
+    // set before create(): this session runs on the system driver whatever custom driver is selected
+    bool ignore_custom_driver = false;
+    // set by create() when the selected custom driver could not make the swapchain (its objects are already freed)
+    bool custom_driver_cannot_present = false;
 #endif
 
     VKState(int gpu_idx);
@@ -191,6 +198,7 @@ struct VKState : public renderer::State {
 #ifdef __ANDROID__
     bool support_custom_drivers() override;
     void set_turbo_mode(bool set) override;
+    void cleanup_failed_create();
 #endif
     std::string_view get_gpu_name() override;
     uint32_t get_gpu_version() override;
@@ -198,6 +206,9 @@ struct VKState : public renderer::State {
     void precompile_shader(const ShadersHash &hash) override;
     void preclose_action() override;
     void wait_gpu_idle() override;
+    void start_gpu_request_wait_thread(const MemState &mem);
+    void stop_gpu_request_wait_thread();
+    void wait_thread_function(const MemState &mem);
     uint32_t diag_pipelines_created() const override { return pipeline_cache.pipelines_created.load(std::memory_order_relaxed); }
 
     // dumps the resolved device/driver/feature configuration to the log, once, from late_init

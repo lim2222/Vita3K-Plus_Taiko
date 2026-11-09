@@ -26,6 +26,7 @@ object OverlayStore {
     private const val KEY_HIDE_ON_CONTROLLER = "hide_overlay_on_controller"
     private const val KEY_HAPTIC_AMPLITUDE = "haptic_amplitude"
     private const val KEY_HIDE_OVERLAY_TIME = "hide_overlay_time"
+    private const val KEY_TOUCH_SWITCH_TILT = "overlay_touch_switch_tilt"
     private const val KEY_CONFIG_PREFIX = "config"
     private const val KEY_LAYOUT_PREFIX = "layout"
     private const val KEY_POSITION_X_SUFFIX = ":x"
@@ -261,6 +262,7 @@ object OverlayStore {
                 configKey(normalizedScopeId, KEY_HIDE_OVERLAY_TIME),
                 normalizedState.config.hideOverlayTimeSeconds
             )
+            putBoolean(configKey(normalizedScopeId, KEY_TOUCH_SWITCH_TILT), normalizedState.config.touchSwitchTilt)
             saveLayoutEntries(this, normalizedScopeId, normalizedState.layout)
             if (markOverride && normalizedScopeId.isNotEmpty()) {
                 putBoolean(overrideEnabledKey(normalizedScopeId), true)
@@ -305,7 +307,8 @@ object OverlayStore {
                 fallback.hideOverlayWhenControllerConnected
             ),
             hapticAmplitude = prefs.getInt(hapticAmplitudeKey, fallback.hapticAmplitude),
-            hideOverlayTimeSeconds = prefs.getInt(hideOverlayTimeKey, fallback.hideOverlayTimeSeconds)
+            hideOverlayTimeSeconds = prefs.getInt(hideOverlayTimeKey, fallback.hideOverlayTimeSeconds),
+            touchSwitchTilt = prefs.getBoolean(configKey(scopeId, KEY_TOUCH_SWITCH_TILT), fallback.touchSwitchTilt)
         ).normalized()
     }
 

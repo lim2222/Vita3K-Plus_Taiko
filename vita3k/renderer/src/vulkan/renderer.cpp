@@ -175,6 +175,13 @@ const static std::vector<const char *> required_device_extensions = {
     vk::KHRMaintenance1ExtensionName
 };
 
+static uint32_t instance_api_version(const vk::detail::DispatchLoaderDynamic &dispatch) {
+    uint32_t version = VK_API_VERSION_1_0;
+    if (!dispatch.vkEnumerateInstanceVersion || dispatch.vkEnumerateInstanceVersion(&version) != VK_SUCCESS)
+        return VK_API_VERSION_1_0;
+    return std::min<uint32_t>(version, VK_API_VERSION_1_1);
+}
+
 namespace renderer::vulkan {
 
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
@@ -406,13 +413,14 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         }
     }
 #ifdef __ANDROID__
-    const bool custom_driver_requested = !config.current_config.custom_driver_name.empty();
+    const std::string custom_driver_name = ignore_custom_driver ? std::string() : config.current_config.custom_driver_name;
+    const bool custom_driver_requested = !custom_driver_name.empty();
 #endif
 
     // Create Instance
     {
 #if defined(__ANDROID__) && defined(USE_ADRENO_TOOLS)
-        PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr = android_driver::resolve_vk_get_instance_proc_addr(config.current_config.custom_driver_name);
+        PFN_vkGetInstanceProcAddr vk_get_instance_proc_addr = android_driver::resolve_vk_get_instance_proc_addr(custom_driver_name);
         if (!vk_get_instance_proc_addr)
             return false;
 
@@ -429,7 +437,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             .applicationVersion = VK_MAKE_API_VERSION(0, 0, 0, 1), // App Version
             .pEngineName = org_name, // Engine Name, using org instead.
             .engineVersion = VK_MAKE_API_VERSION(0, 0, 0, 1), // Engine Version
-            .apiVersion = VK_API_VERSION_1_0
+            .apiVersion = instance_api_version(VULKAN_HPP_DEFAULT_DISPATCHER)
         };
 
         std::vector<const char *> instance_extensions;
@@ -647,9 +655,9 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
                     physical_device_properties.vendorID,
                     physical_device_properties.driverVersion,
                     physical_device_properties.deviceName.data()))
-                LOG_INFO("Custom Adreno driver {} injected successfully", config.current_config.custom_driver_name);
+                LOG_INFO("Custom driver {} injected successfully", config.current_config.custom_driver_name);
             else
-                LOG_WARN("Custom Adreno driver {} fell back to the system Vulkan loader", config.current_config.custom_driver_name);
+                LOG_WARN("Custom driver {} fell back to the system Vulkan loader", config.current_config.custom_driver_name);
         }
 #endif
 
@@ -702,6 +710,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             .wideLines = physical_device_features.wideLines,
             .samplerAnisotropy = physical_device_features.samplerAnisotropy,
             .occlusionQueryPrecise = physical_device_features.occlusionQueryPrecise,
+            .vertexPipelineStoresAndAtomics = physical_device_features.vertexPipelineStoresAndAtomics,
             .fragmentStoresAndAtomics = physical_device_features.fragmentStoresAndAtomics,
             .shaderStorageImageExtendedFormats = physical_device_features.shaderStorageImageExtendedFormats,
             .shaderClipDistance = physical_device_features.shaderClipDistance,
@@ -715,6 +724,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         bool support_buffer_device_address = false;
         bool support_external_memory = false;
         bool support_shader_interlock = false;
+        bool support_float_controls = false;
         const std::map<std::string_view, bool *> optional_extensions = {
             { vk::KHRGetMemoryRequirements2ExtensionName, &temp_bool },
             // can be used by vma to improve performance
@@ -735,6 +745,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             { vk::KHRShaderFloat16Int8ExtensionName, &support_fsr },
             // used for accurate programmable blending on desktop GPUs
             { vk::EXTFragmentShaderInterlockExtensionName, &support_shader_interlock },
+            // lets a pipeline be requested from the driver cache without compiling it
+            { vk::EXTPipelineCreationCacheControlExtensionName, &support_pipeline_cache_control },
 #ifdef __APPLE__
             // Needed to create the MoltenVK device
             { vk::KHRPortabilitySubsetExtensionName, &temp_bool },
@@ -758,6 +770,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         for (const vk::ExtensionProperties &ext : physical_device.enumerateDeviceExtensionProperties()) {
             available_extension_count++;
             available_extensions += (available_extensions.empty() ? "" : ", ") + std::string(ext.extensionName.data());
+            support_float_controls |= std::string_view(ext.extensionName.data()) == vk::KHRShaderFloatControlsExtensionName;
             auto it = optional_extensions.find(ext.extensionName.data());
             if (it != optional_extensions.end()) {
                 // this extension is available on the GPU
@@ -883,8 +896,22 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             features.support_shader_interlock = support_shader_interlock;
         }
 
+        support_pipeline_cache_control &= has_features2_khr;
+        if (support_pipeline_cache_control) {
+            auto props = physical_device.getFeatures2KHR<vk::PhysicalDeviceFeatures2, vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT>();
+            support_pipeline_cache_control = static_cast<bool>(props.get<vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT>().pipelineCreationCacheControl);
+        }
+
         constexpr bool raw_preserve_needs_interlock = false;
         features.preserve_f16_nan_as_u16 = static_cast<bool>(physical_device_features.independentBlend) && (!raw_preserve_needs_interlock || features.support_shader_interlock);
+
+        // Adreno 6xx and 7xx flush fp16 denormals in packHalf2x16 which zeroes small F16 constants such as Scaleform texgen scales
+        bool preserves_f16_denormals = false;
+        if ((physical_device_properties.apiVersion >= VK_API_VERSION_1_2 || support_float_controls) && VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2KHR) {
+            const auto float_controls = physical_device.getProperties2KHR<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties>();
+            preserves_f16_denormals = static_cast<bool>(float_controls.get<vk::PhysicalDeviceFloatControlsProperties>().shaderDenormPreserveFloat16);
+        }
+        features.emulate_f16_denormals = !preserves_f16_denormals;
 
         // depth clamp turns off z-clipping, so behind-the-eye primitives must be clipped in the shader instead
         features.support_clip_distance = enable_depth_clamp && static_cast<bool>(physical_device_features.depthClamp) && static_cast<bool>(physical_device_features.shaderClipDistance);
@@ -892,12 +919,16 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         // a vertex program's own clip planes are unrelated to the depth clamp so they only need the device feature
         features.support_gxm_clip_planes = static_cast<bool>(physical_device_features.shaderClipDistance);
 
+        if (!physical_device_features.vertexPipelineStoresAndAtomics && physical_device_features.fragmentStoresAndAtomics)
+            features.vertex_store_slots = static_cast<int>(std::min(physical_device_properties.limits.maxVertexOutputComponents, physical_device_properties.limits.maxFragmentInputComponents) / 4) - 2;
+
         vk::StructureChain<vk::DeviceCreateInfo,
             vk::PhysicalDeviceBufferDeviceAddressFeatures,
             vk::PhysicalDeviceUniformBufferStandardLayoutFeatures,
             vk::PhysicalDeviceShaderFloat16Int8Features,
             vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT,
-            vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT>
+            vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT,
+            vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT>
             device_info{
                 vk::DeviceCreateInfo{
                     .pEnabledFeatures = &enabled_features },
@@ -911,7 +942,9 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
                 vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT{
                     .fragmentShaderSampleInterlock = VK_TRUE },
                 vk::PhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT{
-                    .rasterizationOrderColorAttachmentAccess = VK_TRUE }
+                    .rasterizationOrderColorAttachmentAccess = VK_TRUE },
+                vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT{
+                    .pipelineCreationCacheControl = VK_TRUE }
             };
         device_info.get().setQueueCreateInfos(queue_infos);
         device_info.get().setPEnabledExtensionNames(device_extensions);
@@ -930,6 +963,9 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
         if (!support_shader_interlock)
             device_info.unlink<vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>();
+
+        if (!support_pipeline_cache_control)
+            device_info.unlink<vk::PhysicalDevicePipelineCreationCacheControlFeaturesEXT>();
 
         try {
             device = physical_device.createDevice(device_info.get());
@@ -992,6 +1028,9 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         if (supported_mapping_methods_mask > 1)
             allocator_info.flags |= vma::AllocatorCreateFlagBits::eBufferDeviceAddress;
 
+        if (mem_diag::low_memory_device())
+            allocator_info.preferredLargeHeapBlockSize = MiB(64);
+
         allocator = vma::createAllocator(allocator_info);
         vkutil::init(allocator);
     }
@@ -1049,8 +1088,15 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         frame.destroy_queue.init(device);
     }
 
-    if (!screen_renderer.setup())
+    if (!screen_renderer.setup()) {
+#ifdef __ANDROID__
+        if (custom_driver_requested) {
+            cleanup_failed_create();
+            custom_driver_cannot_present = true;
+        }
+#endif
         return false;
+    }
 
     init_overlay_font_dirs();
 
@@ -1083,6 +1129,8 @@ void VKState::late_init(const Config &cfg, const std::string_view game_id, MemSt
         features.direct_fragcolor = true;
         features.support_shader_interlock = false;
     }
+
+    features.support_depth_mirror = features.should_use_shader_interlock() && deep_stencil_use == vk::Format::eD32SfloatS8Uint;
 
     // Diagnostic/workaround: without VK_EXT/ARM_rasterization_order_attachment_access, overlapping
     // primitives inside ONE draw have no defined order when the shader reads the colour attachment
@@ -1219,12 +1267,12 @@ void VKState::log_gpu_configuration(const Config &cfg) {
     LOG_INFO("  FeatureState: use_mask_bit={} support_unknown_format={} support_rgb_attributes={} support_scaled_attribute_formats={}",
         features.use_mask_bit, features.support_unknown_format, features.support_rgb_attributes,
         features.support_scaled_attribute_formats);
-    LOG_INFO("  FeatureState: enable_memory_mapping={} use_texture_viewport={} spirv_shader={} features_mask=0x{:X}",
-        features.enable_memory_mapping, features.use_texture_viewport, features.spirv_shader, get_features_mask());
-    LOG_INFO("  derived: should_use_shader_interlock={} should_use_texture_barrier={} programmable_blending={}",
+    LOG_INFO("  FeatureState: enable_memory_mapping={} use_texture_viewport={} spirv_shader={} emulate_f16_denormals={} features_mask=0x{:X}",
+        features.enable_memory_mapping, features.use_texture_viewport, features.spirv_shader, features.emulate_f16_denormals, get_features_mask());
+    LOG_INFO("  derived: should_use_shader_interlock={} should_use_texture_barrier={} programmable_blending={} support_depth_mirror={}",
         features.should_use_shader_interlock(), features.should_use_texture_barrier(),
-        features.is_programmable_blending_supported());
-    LOG_INFO("  build switches: enable_depth_clamp={} support_clip_distance={} gxm_clip_planes={}", enable_depth_clamp, features.support_clip_distance, features.support_gxm_clip_planes);
+        features.is_programmable_blending_supported(), features.support_depth_mirror);
+    LOG_INFO("  build switches: enable_depth_clamp={} support_clip_distance={} gxm_clip_planes={} vertex_store_slots={}", enable_depth_clamp, features.support_clip_distance, features.support_gxm_clip_planes, features.vertex_store_slots);
 
     const char *mapping_names[] = { "Disabled", "DoubleBuffer", "ExternalHost", "PageTable", "NativeBuffer" };
     const int mapping_idx = static_cast<int>(mapping_method);
@@ -1247,9 +1295,9 @@ void VKState::cleanup() {
         descriptor.descriptors_idx = 0;
     };
 
-    device.waitIdle();
+    wait_gpu_idle();
 
-    request_queue.abort();
+    stop_gpu_request_wait_thread();
 
     context = nullptr;
 
@@ -1515,13 +1563,21 @@ void VKState::swap_window() {
     // Android asked us to give memory back!
     const int trim_level = memory_trim_level.exchange(-1, std::memory_order_relaxed);
     if (trim_level >= 0) {
-        device.waitIdle();
-        const uint64_t freed = texture_cache.release_all_cached_textures();
+        constexpr int trim_ui_hidden = 20;
+        uint64_t freed = 0;
+        if (trim_level >= trim_ui_hidden) {
+            device.waitIdle();
+            freed = texture_cache.release_all_cached_textures();
+        } else {
+            freed = texture_cache.release_idle_textures();
+        }
         LOG_WARN("[ANDROID MEMORY] trim level {}: released {} MiB of cached textures", trim_level, freed / (1024 * 1024));
         dormant_trim_requested = true;
         mem_diag::log_memory_snapshot("post-trim");
         logging::flush();
     }
+
+    texture_cache.relieve_memory_pressure();
 
     // look once a frame if we need to save the pipeline cache
     const auto time_s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1540,9 +1596,8 @@ void VKState::swap_window() {
     }
 
     if (time_s >= pipeline_cache.next_pipeline_cache_save) {
-        pipeline_cache.save_pipeline_cache();
-
         pipeline_cache.next_pipeline_cache_save = std::numeric_limits<uint64_t>::max();
+        pipeline_cache.save_pipeline_cache_async();
     }
 }
 
@@ -1574,6 +1629,7 @@ uint32_t VKState::get_features_mask() {
             bool use_clip_distance : 1;
             bool use_gxm_clip_planes : 1;
             bool force_full_precision : 1;
+            bool emulate_f16_denormals : 1;
         };
         uint32_t value;
     } features_mask;
@@ -1593,6 +1649,7 @@ uint32_t VKState::get_features_mask() {
     features_mask.use_clip_distance = features.support_clip_distance;
     features_mask.use_gxm_clip_planes = features.support_gxm_clip_planes;
     features_mask.force_full_precision = features.force_full_precision;
+    features_mask.emulate_f16_denormals = features.emulate_f16_denormals;
 
     return features_mask.value;
 }
@@ -2095,7 +2152,7 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
     }
 
     // we need to wait in case the buffer is being used
-    device.waitIdle();
+    wait_gpu_idle();
 
     // Drain the GPU wait thread's queue too
     {
@@ -2311,7 +2368,7 @@ renderer::VulkanDeviceInfo renderer::enumerate_vulkan_devices(const std::string 
 #endif
 
         vk::ApplicationInfo app_info{
-            .apiVersion = VK_API_VERSION_1_0
+            .apiVersion = instance_api_version(dispatch)
         };
 
         std::vector<const char *> instance_extensions;
@@ -2379,8 +2436,7 @@ void VKState::precompile_shader(const ShadersHash &hash) {
 
 void VKState::preclose_action() {
     // Stop the GPU request wait thread before destruction begins.
-    // VKState (owns the queue) is destroyed before VKContext (owns the thread).
-    request_queue.abort();
+    stop_gpu_request_wait_thread();
 
     // make sure we are in a game
     if (shaders_path.empty())
@@ -2400,6 +2456,47 @@ void VKState::wait_gpu_idle() {
 }
 
 #ifdef __ANDROID__
+void VKState::cleanup_failed_create() {
+    screen_renderer.cleanup();
+
+    default_image.destroy();
+    default_raw_image.destroy();
+    default_buffer.destroy();
+
+    for (int i = 0; i < MAX_FRAMES_RENDERING; i++) {
+        device.destroy(frames[i].render_pool);
+        frames[i].render_pool = nullptr;
+        device.destroy(frames[i].prerender_pool);
+        frames[i].prerender_pool = nullptr;
+    }
+
+    device.destroy(general_command_pool);
+    general_command_pool = nullptr;
+    device.destroy(transfer_command_pool);
+    transfer_command_pool = nullptr;
+    device.destroy(multithread_command_pool);
+    multithread_command_pool = nullptr;
+
+    allocator.destroy();
+
+    vkutil::deinit();
+
+    device.destroy();
+    device = nullptr;
+
+    if (debug_messenger) {
+        instance.destroyDebugUtilsMessengerEXT(debug_messenger);
+        debug_messenger = nullptr;
+    }
+    if (debug_report) {
+        instance.destroyDebugReportCallbackEXT(debug_report);
+        debug_report = nullptr;
+    }
+
+    instance.destroy();
+    instance = nullptr;
+}
+
 bool VKState::support_custom_drivers() {
     // vendor ID 0x5143 is Qualcomm, being stock or turnip
     return physical_device_properties.vendorID == 0x5143;

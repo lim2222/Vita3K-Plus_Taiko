@@ -25,6 +25,8 @@
 #include <atomic>
 #include <limits>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -55,6 +57,21 @@ struct CompileRequest;
 
 using PipelineCompileQueue = moodycamel::BlockingConcurrentQueue<CompileRequest *>;
 
+struct VertexStreamLayout {
+    static constexpr uint32_t MAX_ATTRIBUTES = 32;
+    struct Copy {
+        uint32_t src;
+        uint32_t dst;
+        uint32_t size;
+    };
+    bool repack = false;
+    uint32_t stride = 0;
+    uint32_t record_size = 0;
+    std::array<uint32_t, MAX_ATTRIBUTES> offsets{};
+    std::array<Copy, MAX_ATTRIBUTES> copies{};
+    uint32_t copy_count = 0;
+};
+
 class PipelineCache {
     friend struct VKState;
 
@@ -81,6 +98,7 @@ private:
     static constexpr int pipeline_cache_save_delay = 15;
 
     vk::PipelineCache pipeline_cache;
+    vk::ShaderModule vertex_store_fragment_module;
 
     // first index: 0 if color is backed by memory, 1 otherwise
     // second index: 1 if the depth aspect is loaded at scene start, 0 if cleared
@@ -98,6 +116,60 @@ private:
     unordered_map_stable<Sha256Hash, vk::ShaderModule> shaders;
     unordered_map_stable<uint64_t, vk::Pipeline> pipelines;
     std::unordered_set<uint64_t> raw_pipeline_keys_seen;
+
+    // the driver can hand over a pipeline from its cache without compiling it (VK_EXT_pipeline_creation_cache_control)
+    bool support_cache_only_creation = false;
+
+    // background compiles of the vertex/fragment pairs a game creates, so the driver cache already holds their
+    // shaders when the first draw needs a pipeline
+    struct WarmRequest {
+        std::shared_ptr<ProgramBinding> vertex;
+        std::shared_ptr<ProgramBinding> fragment;
+        uint64_t pair_key;
+    };
+    moodycamel::BlockingConcurrentQueue<WarmRequest *> warm_queue;
+    std::vector<std::thread> warm_threads;
+    std::atomic<bool> warm_enabled{ false };
+    std::atomic<bool> warm_stopping{ false };
+    std::mutex warm_mutex;
+    std::unordered_set<uint64_t> warm_pairs_requested;
+    // pairs a draw created a pipeline for before their warm compile started
+    std::unordered_set<uint64_t> pairs_drawn;
+    vk::RenderPass warm_render_pass;
+    vk::RenderPass warm_interlock_render_pass;
+
+    // the draw state that changes what the driver compiles for a shader pair: the surface format, the raw F16
+    // attachment and surface casts. The warm threads use the states draws use most, learned while the game runs.
+    struct WarmState {
+        uint32_t color_format = 0;
+        bool raw = false;
+        bool casts = false;
+        vk::RenderPass render_pass;
+        vk::RenderPass interlock_render_pass;
+        uint64_t key() const {
+            return (static_cast<uint64_t>(color_format) << 2) | (raw ? 2 : 0) | (casts ? 1 : 0);
+        }
+    };
+    // every pipeline the render thread creates counts its draw state (render thread only)
+    std::map<uint64_t, std::pair<WarmState, uint32_t>> draw_states;
+    uint32_t draw_states_total = 0;
+    // the states the warm threads use, guarded by warm_mutex
+    std::vector<WarmState> warm_states;
+    void note_draw_state(const WarmState &draw_state);
+    void warm_thread(MemState &mem);
+    void warm_pair(const WarmRequest &request, MemState &mem);
+    void stop_warm_threads();
+    bool codegen_ignores_draw_hints(const SceGxmProgram &program, bool is_vertex, const shader::Hints &hints);
+    bool shader_available(const SceGxmProgram &program, const Sha256Hash &base_hash, bool is_vertex, const shader::Hints &hints);
+
+    // in async mode, true when skipping the draw while its pipeline compiles could leave a glitch outlasting the frame
+    bool must_not_skip_draw(const GxmRecordState &record, bool consider_for_async) const;
+
+    // the periodic save runs on its own thread
+    std::thread save_thread;
+    std::atomic<bool> save_running{ false };
+    void write_pipeline_cache(const std::vector<uint64_t> &keys);
+    void wait_for_background_save();
 
     // --- diagnostics -------------------------------------------------------------------------
     // Everything below only exists so that a single run produces enough information to explain a
@@ -120,7 +192,8 @@ private:
     // variant the driver accepts. This is what turns "ErrorOutOfHostMemory" into an actual answer.
     void bisect_pipeline_failure(const vk::GraphicsPipelineCreateInfo &failing_info);
 
-    vk::PipelineShaderStageCreateInfo retrieve_shader(const SceGxmProgram *program, const Sha256Hash &hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb = false, bool has_casts = false);
+    // ready_only: return an empty stage instead of loading or translating a shader that has no module yet
+    vk::PipelineShaderStageCreateInfo retrieve_shader(const SceGxmProgram *program, const Sha256Hash &hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb = false, bool has_casts = false, bool ready_only = false);
     vk::PipelineVertexInputStateCreateInfo get_vertex_input_state(const ProgramBinding &vertex_program);
 
     // queue containing request sent by the main thread to the compile threads
@@ -133,7 +206,8 @@ private:
     // each pipeline compiler thread uses this function as its entrypoint
     void compiler_thread(MemState &mem);
 
-    vk::Pipeline compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const ProgramBinding &vertex_program_binding, const ProgramBinding &fragment_program_binding, const GxmRecordState &record, bool has_color_surface_data, const shader::Hints &hints, bool has_casts, MemState &mem);
+    // cache_only: return the pipeline only if the driver has it cached
+    vk::Pipeline compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const ProgramBinding &vertex_program_binding, const ProgramBinding &fragment_program_binding, const GxmRecordState &record, bool has_color_surface_data, const shader::Hints &hints, bool has_casts, MemState &mem, bool cache_only = false);
 
 public:
     size_t pipeline_key_count() const { return pipelines.size(); }
@@ -161,16 +235,20 @@ public:
 
     void read_pipeline_cache();
     void save_pipeline_cache();
+    // the periodic save written by a background thread
+    void save_pipeline_cache_async();
+    // queue a background compile of a vertex/fragment pair the game has just created
+    void warm_program_pair(const std::shared_ptr<ProgramBinding> &vertex, const std::shared_ptr<ProgramBinding> &fragment);
 
     vk::RenderPass retrieve_render_pass(vk::Format format, bool depth_load, bool stencil_load, bool force_store, bool is_color_transient, bool no_color = false, bool has_raw_attachment = false);
-    vk::Pipeline retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem);
+    vk::Pipeline retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem, bool vertex_store_pass = false);
 
     vk::ShaderModule precompile_shader(const Sha256Hash &hash, bool search_first = true);
 
     // true when an attribute offset is past maxVertexInputAttributeOffset
     bool needs_attribute_bindings(const ProgramBinding &vertex_program) const;
-    // true when the stride of the stream leaves one of its attributes unaligned so it is repacked into a multiple of 4
-    bool needs_restride(const ProgramBinding &vertex_program, uint32_t stream_index) const;
+    // the binding stride and attribute offsets of a stream, repacked when an attribute address would not be a multiple of its component size
+    VertexStreamLayout vertex_stream_layout(const ProgramBinding &vertex_program, uint32_t stream_index) const;
 
     void set_async_compilation(bool enable);
 };

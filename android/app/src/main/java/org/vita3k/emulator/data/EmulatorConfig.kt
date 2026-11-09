@@ -40,6 +40,7 @@ class EmulatorConfig {
     @JvmField var ngsEnable: Boolean = true
     @JvmField var disableMotion: Boolean = false
     @JvmField var controllerAnalogMultiplier: Float = 1.0f
+    @JvmField var controllerSwapTriggers: Boolean = false
     @JvmField var controllerBinds: IntArray = defaultControllerBinds()
     @JvmField var controllerAxisBinds: IntArray = defaultControllerAxisBinds()
 
@@ -131,6 +132,7 @@ class EmulatorConfig {
         config.ngsEnable = ngsEnable
         config.disableMotion = disableMotion
         config.controllerAnalogMultiplier = controllerAnalogMultiplier
+        config.controllerSwapTriggers = controllerSwapTriggers
         config.controllerBinds = controllerBinds.copyOf()
         config.controllerAxisBinds = controllerAxisBinds.copyOf()
         config.screenOrientation = screenOrientation
@@ -215,6 +217,7 @@ class EmulatorConfig {
             ngsEnable == other.ngsEnable &&
             disableMotion == other.disableMotion &&
             controllerAnalogMultiplier == other.controllerAnalogMultiplier &&
+            controllerSwapTriggers == other.controllerSwapTriggers &&
             controllerBinds.contentEquals(other.controllerBinds) &&
             controllerAxisBinds.contentEquals(other.controllerAxisBinds) &&
             screenOrientation == other.screenOrientation &&
@@ -295,6 +298,7 @@ class EmulatorConfig {
         result = 31 * result + ngsEnable.hashCode()
         result = 31 * result + disableMotion.hashCode()
         result = 31 * result + controllerAnalogMultiplier.hashCode()
+        result = 31 * result + controllerSwapTriggers.hashCode()
         result = 31 * result + controllerBinds.contentHashCode()
         result = 31 * result + controllerAxisBinds.contentHashCode()
         result = 31 * result + screenOrientation

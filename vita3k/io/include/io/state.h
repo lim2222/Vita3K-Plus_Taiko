@@ -103,6 +103,7 @@ struct IOState {
     struct DevicePaths {
         std::string app0;
         std::string savedata0;
+        std::string savedata1; // another title's save data mounted by sceAppUtilSaveDataMount, empty when none
         std::string addcont0;
     } device_paths;
 
@@ -111,6 +112,7 @@ struct IOState {
     std::string savedata;
     std::string title_id;
     std::string app_path;
+    int title_file_loading_delay = 0;
 
     std::string user_id;
     std::string user_name;

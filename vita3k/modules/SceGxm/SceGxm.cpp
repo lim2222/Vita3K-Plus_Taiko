@@ -17,6 +17,7 @@
 
 #include "SceGxm.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cpu/functions.h>
@@ -990,6 +991,8 @@ static std::mutex mtx;
 static std::unordered_set<const renderer::CommandList *> lists;
 } // namespace command_list_registry
 
+static constexpr uint32_t IMMEDIATE_COMMAND_RING_SLOTS = 65536;
+
 static Ptr<void> gxmRunDeferredMemoryCallback(KernelState &kernel, const MemState &mem, std::mutex &global_lock, std::uint32_t &return_size, Ptr<SceGxmDeferredContextCallback> callback, Ptr<void> userdata,
     const std::uint32_t size, const SceUID thread_id) {
     const std::uint32_t min_size = std::max<std::uint32_t>(1024, size + 4);
@@ -1183,7 +1186,8 @@ struct SceGxmContext {
             actual_size = state.vdm_buffer_size;
 
             if (state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
-                command_allocator_size = state.vdm_buffer_size / sizeof(renderer::Command);
+                renderer->command_ring.resize(IMMEDIATE_COMMAND_RING_SLOTS);
+                command_allocator_size = IMMEDIATE_COMMAND_RING_SLOTS;
                 command_next_free_pos = 0;
                 command_last_free_pos = command_allocator_size - 1;
             } else {
@@ -1240,7 +1244,7 @@ struct SceGxmContext {
             if (command_allocator_size > 0 && command_next_free_pos <= command_last_free_pos.load(std::memory_order_acquire)) {
                 size_t offset = command_next_free_pos % command_allocator_size;
                 command_next_free_pos++;
-                new_command = alloc_space.cast<renderer::Command>().get(mem) + offset;
+                new_command = reinterpret_cast<renderer::Command *>(renderer->command_ring.data()) + offset;
                 new (new_command) renderer::Command;
             } else {
                 new_command = new renderer::Command;
@@ -1322,7 +1326,12 @@ static int destroy_gxm_context(EmuEnvState &emuenv, SceGxmContext *context, cons
     }
 
     if (context->state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE) {
-        if (emuenv.gxm.immediate_context != context_addr) {
+        const auto immediate_context = emuenv.gxm.immediate_contexts.find(context);
+        if (immediate_context == emuenv.gxm.immediate_contexts.end()) {
+            return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
+        }
+
+        if (context_addr != 0 && immediate_context->second != context_addr) {
             return static_cast<int>(SCE_GXM_ERROR_INVALID_POINTER);
         }
 
@@ -1335,10 +1344,19 @@ static int destroy_gxm_context(EmuEnvState &emuenv, SceGxmContext *context, cons
         if (force_backend_destroy) {
             renderer::destroy_context_during_shutdown(*emuenv.renderer, context->renderer);
         } else {
+            guest_sched_release_for_block();
             renderer::destroy_context(*emuenv.renderer, context->renderer);
         }
 
-        emuenv.gxm.immediate_context = 0;
+        if (emuenv.gxm.last_immediate_context == immediate_context->second) {
+            emuenv.gxm.last_immediate_context = 0;
+        }
+        {
+            const std::lock_guard<std::mutex> lock(emuenv.gxm.open_scenes_mutex);
+            emuenv.gxm.open_scenes.erase(context);
+        }
+        emuenv.gxm.open_scenes_cond.notify_all();
+        emuenv.gxm.immediate_contexts.erase(immediate_context);
     } else if (context->state.type == SCE_GXM_CONTEXT_TYPE_DEFERRED) {
         const auto deferred_context = emuenv.gxm.deferred_contexts.find(context);
         if (deferred_context == emuenv.gxm.deferred_contexts.end()) {
@@ -1374,8 +1392,10 @@ static int destroy_gxm_context(EmuEnvState &emuenv, Ptr<SceGxmContext> context_p
 namespace gxm {
 
 void destroy_all_contexts(EmuEnvState &emuenv, const bool force_backend_destroy) {
-    if (emuenv.gxm.immediate_context != 0) {
-        const int result = destroy_gxm_context(emuenv, Ptr<SceGxmContext>(emuenv.gxm.immediate_context), force_backend_destroy);
+    for (auto immediate_context = emuenv.gxm.immediate_contexts.begin(); immediate_context != emuenv.gxm.immediate_contexts.end();) {
+        const auto current_context = immediate_context++;
+        const auto [context, context_addr] = *current_context;
+        const int result = destroy_gxm_context(emuenv, context, context_addr, force_backend_destroy);
         if (result < 0) {
             LOG_WARN("Failed to destroy immediate GXM context during cleanup: {}", log_hex(result));
         }
@@ -1437,6 +1457,7 @@ static int destroy_gxm_render_target(EmuEnvState &emuenv, SceGxmRenderTarget *re
     if (force_backend_destroy) {
         renderer::destroy_render_target_during_shutdown(*emuenv.renderer, render_target->renderer);
     } else {
+        guest_sched_release_for_block();
         renderer::destroy_render_target(*emuenv.renderer, render_target->renderer);
     }
 
@@ -1540,6 +1561,7 @@ struct SceGxmShaderPatcher {
     VertexProgramCache vertex_program_cache;
     FragmentProgramCache fragment_program_cache;
     SceGxmShaderPatcherParams params;
+    std::multimap<Address, std::weak_ptr<renderer::ProgramBinding>> pending_warm;
 };
 
 // clang-format off
@@ -1793,6 +1815,8 @@ EXPORT(int, sceGxmBeginCommandList, SceGxmContext *deferredContext) {
     return 0;
 }
 
+static thread_local const SceGxmDepthStencilSurface *scene_ex_store_surface = nullptr;
+
 EXPORT(int, sceGxmBeginScene, SceGxmContext *context, uint32_t flags, const SceGxmRenderTarget *renderTarget, const SceGxmValidRegion *validRegion, SceGxmSyncObject *vertexSyncObject, Ptr<SceGxmSyncObject> fragmentSyncObject, const SceGxmColorSurface *colorSurface, const SceGxmDepthStencilSurface *depthStencil) {
     TRACY_FUNC(sceGxmBeginScene, context, flags, renderTarget, validRegion, vertexSyncObject, fragmentSyncObject, colorSurface, depthStencil);
     if (!context) {
@@ -1829,6 +1853,10 @@ EXPORT(int, sceGxmBeginScene, SceGxmContext *context, uint32_t flags, const SceG
     // It's legal to set at client.
     context->state.active = true;
     context->last_precomputed = false;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.open_scenes_mutex);
+        emuenv.gxm.open_scenes[context] = { thread_id, ++emuenv.gxm.open_scene_serial };
+    }
 
     // set all textures as dirty, in case their content is modified (even though I really don't think it would)
     // or some texture is the current framebuffer
@@ -1848,8 +1876,13 @@ EXPORT(int, sceGxmBeginScene, SceGxmContext *context, uint32_t flags, const SceG
         *depth_stencil_surface_copy = *depthStencil;
     }
 
-    renderer::set_context(*emuenv.renderer, context->renderer.get(), renderTarget->renderer.get(), color_surface_copy,
-        depth_stencil_surface_copy);
+    SceGxmDepthStencilSurface *store_surface_copy = nullptr;
+    if (scene_ex_store_surface) {
+        store_surface_copy = new SceGxmDepthStencilSurface;
+        *store_surface_copy = *scene_ex_store_surface;
+    }
+
+    renderer::set_context(*emuenv.renderer, context->renderer.get(), renderTarget->renderer.get(), color_surface_copy, depth_stencil_surface_copy, store_surface_copy);
 
     const std::uint32_t xmax = (validRegion ? validRegion->xMax : renderTarget->width - 1);
     const std::uint32_t ymax = (validRegion ? validRegion->yMax : renderTarget->height - 1);
@@ -1881,8 +1914,11 @@ EXPORT(int, sceGxmBeginSceneEx, SceGxmContext *immediateContext, uint32_t flags,
         return RET_ERROR(SCE_GXM_ERROR_WITHIN_SCENE);
     }
 
-    STUBBED("Using sceGxmBeginScene");
-    return CALL_EXPORT(sceGxmBeginScene, immediateContext, flags, renderTarget, validRegion, vertexSyncObject, fragmentSyncObject, colorSurface, loadDepthStencilSurface);
+    const bool separate_store = storeDepthStencilSurface && (!loadDepthStencilSurface || loadDepthStencilSurface->depth_data.address() != storeDepthStencilSurface->depth_data.address() || loadDepthStencilSurface->stencil_data.address() != storeDepthStencilSurface->stencil_data.address());
+    scene_ex_store_surface = separate_store ? storeDepthStencilSurface : nullptr;
+    const int result = CALL_EXPORT(sceGxmBeginScene, immediateContext, flags, renderTarget, validRegion, vertexSyncObject, fragmentSyncObject, colorSurface, loadDepthStencilSurface);
+    scene_ex_store_surface = nullptr;
+    return result;
 }
 
 DECL_EXPORT(int, sceGxmTextureInitLinear, SceGxmTexture *texture, Ptr<const void> data, SceGxmTextureFormat texFormat, uint32_t width, uint32_t height, uint32_t mipCount);
@@ -1951,7 +1987,7 @@ EXPORT(SceGxmColorSurfaceType, sceGxmColorSurfaceGetType, const SceGxmColorSurfa
 
 EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorFormat colorFormat, SceGxmColorSurfaceType surfaceType, SceGxmColorSurfaceScaleMode scaleMode, SceGxmOutputRegisterSize outputRegisterSize, uint32_t width, uint32_t height, uint32_t strideInPixels, Ptr<void> data) {
     TRACY_FUNC(sceGxmColorSurfaceInit, surface, colorFormat, surfaceType, scaleMode, outputRegisterSize, width, height, strideInPixels, data);
-    if (!surface || !data)
+    if (!surface)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
     if (width == 0 || width > 4096 || height == 0 || height > 4096)
@@ -2104,10 +2140,6 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
     if (!params || !context)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
 
-    if (emuenv.gxm.immediate_context != 0) {
-        return RET_ERROR(SCE_GXM_ERROR_ALREADY_INITIALIZED);
-    }
-
     if (params->hostMemSize < sizeof(SceGxmContext)) {
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
     }
@@ -2125,6 +2157,7 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
 
     ctx->state.type = SCE_GXM_CONTEXT_TYPE_IMMEDIATE;
 
+    guest_sched_release_for_block();
     if (!renderer::create_context(*emuenv.renderer, ctx->renderer)) {
         ctx->~SceGxmContext();
         context->reset();
@@ -2150,17 +2183,19 @@ EXPORT(int, sceGxmCreateContext, const SceGxmContextParams *params, Ptr<SceGxmCo
         return ctx->free_new_command(cmd);
     };
 
-    ctx->renderer->describe_command_allocator = [ctx, mem]() {
-        const renderer::Command *ring = ctx->alloc_space.cast<renderer::Command>().get(*mem);
+    ctx->renderer->describe_command_allocator = [ctx]() {
+        const renderer::Command *ring = reinterpret_cast<const renderer::Command *>(ctx->renderer->command_ring.data());
         const size_t last_free = ctx->command_last_free_pos.load(std::memory_order_relaxed);
         const size_t size = ctx->command_allocator_size;
-        return fmt::format("immediate ring {}..{} ({} slots) in guest vdm 0x{:08X} | alloc_pos {} free_pos {} outstanding {}",
-            fmt::ptr(ring), fmt::ptr(ring + size), size, ctx->alloc_space.address(),
+        return fmt::format("immediate host ring {}..{} ({} slots) | alloc_pos {} free_pos {} outstanding {}",
+            fmt::ptr(ring), fmt::ptr(ring + size), size,
             ctx->command_next_free_pos, last_free,
             static_cast<int64_t>(ctx->command_next_free_pos) - static_cast<int64_t>(last_free) + static_cast<int64_t>(size) - 1);
     };
 
-    emuenv.gxm.immediate_context = context->address();
+    emuenv.gxm.immediate_contexts.emplace(ctx, context->address());
+    if (emuenv.gxm.last_immediate_context == 0)
+        emuenv.gxm.last_immediate_context = context->address();
     return 0;
 }
 
@@ -2221,6 +2256,7 @@ EXPORT(int, sceGxmCreateRenderTarget, const SceGxmRenderTargetParams *params, Pt
     }
 
     SceGxmRenderTarget *const rt = renderTarget->get(emuenv.mem);
+    guest_sched_release_for_block();
     if (!renderer::create_render_target(*emuenv.renderer, rt->renderer, params)) {
         free(emuenv.mem, *renderTarget);
         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
@@ -2437,8 +2473,13 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
 
     // TODO: I do this because the sync function does not have access to the display state, but this is not great
     renderer::Context *active_renderer_context = nullptr;
-    if (emuenv.gxm.immediate_context != 0)
-        active_renderer_context = Ptr<SceGxmContext>(emuenv.gxm.immediate_context).get(emuenv.mem)->renderer.get();
+    if (emuenv.gxm.last_immediate_context != 0) {
+        const auto immediate_context = std::ranges::find_if(emuenv.gxm.immediate_contexts, [&](const auto &entry) {
+            return entry.second == emuenv.gxm.last_immediate_context;
+        });
+        if (immediate_context != emuenv.gxm.immediate_contexts.end())
+            active_renderer_context = immediate_context->first->renderer.get();
+    }
 
     renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::NewFrame, false, frame, &emuenv.display, active_renderer_context);
 
@@ -2868,7 +2909,16 @@ EXPORT(int, sceGxmEndScene, SceGxmContext *context, SceGxmNotification *vertexNo
     renderer::submit_command_list(*emuenv.renderer, context->renderer.get(), context->renderer->command_list);
     renderer::reset_command_list(context->renderer->command_list);
 
+    const auto immediate_context = emuenv.gxm.immediate_contexts.find(context);
+    if (immediate_context != emuenv.gxm.immediate_contexts.end())
+        emuenv.gxm.last_immediate_context = immediate_context->second;
+
     context->state.active = false;
+    {
+        const std::lock_guard<std::mutex> lock(emuenv.gxm.open_scenes_mutex);
+        emuenv.gxm.open_scenes.erase(context);
+    }
+    emuenv.gxm.open_scenes_cond.notify_all();
     return 0;
 }
 
@@ -2908,12 +2958,9 @@ EXPORT(int, sceGxmFinish, SceGxmContext *context) {
     if (!context)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_THREAD);
 
-    // a deferred context has no command allocator outside a command list so its wait uses the generic one
-    renderer::Context *const wait_context = context->state.type == SCE_GXM_CONTEXT_TYPE_IMMEDIATE ? context->renderer.get() : nullptr;
-
     // Wait on this context's rendering finish code.
     guest_sched_release_for_block();
-    renderer::finish(*emuenv.renderer, wait_context);
+    renderer::finish(*emuenv.renderer, nullptr);
 
     return 0;
 }
@@ -3161,8 +3208,10 @@ EXPORT(int, sceGxmMapMemory, Ptr<void> base, uint32_t size, uint32_t attribs) {
 
         // little big planet maps regions of size 0
         // thread_id lets the renderer's stop-the-world handler exclude this blocked caller from its wait.
-        if (emuenv.renderer->features.enable_memory_mapping && size > 0)
+        if (emuenv.renderer->features.enable_memory_mapping && size > 0) {
+            guest_sched_release_for_block();
             renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryMap, true, aligned_base, size, static_cast<uint32_t>(thread_id));
+        }
 
         return 0;
     }
@@ -4815,6 +4864,18 @@ EXPORT(int, sceGxmShaderPatcherCreate, const SceGxmShaderPatcherParams *params, 
     return 0;
 }
 
+// the renderer compiles each vertex/fragment pair in the background while the game creates its programs (usually while
+// loading), so the driver has compiled the shaders before the first draw needs them
+static void warm_program_pair(EmuEnvState &emuenv, SceGxmShaderPatcher &patcher, Address vertex_program, const std::shared_ptr<renderer::ProgramBinding> &fragment) {
+    for (const auto &[key, program] : patcher.vertex_program_cache) {
+        if (key.vertex_program.program.address() == vertex_program) {
+            renderer::warm_pipeline(*emuenv.renderer, program.get(emuenv.mem)->renderer_binding, fragment);
+            return;
+        }
+    }
+    patcher.pending_warm.emplace(vertex_program, fragment);
+}
+
 EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shaderPatcher, const SceGxmRegisteredProgram *programId, SceGxmOutputRegisterFormat outputFormat, SceGxmMultisampleMode multisampleMode, const SceGxmBlendInfo *blendInfo, Ptr<const SceGxmProgram> vertexProgram, Ptr<SceGxmFragmentProgram> *fragmentProgram) {
     TRACY_FUNC(sceGxmShaderPatcherCreateFragmentProgram, shaderPatcher, programId, outputFormat, multisampleMode, blendInfo, vertexProgram, fragmentProgram);
     MemState &mem = emuenv.mem;
@@ -4874,6 +4935,8 @@ EXPORT(int, sceGxmShaderPatcherCreateFragmentProgram, SceGxmShaderPatcher *shade
     gxm_program_register(fragmentProgram->address(), GxmProgramKind::Fragment);
 
     shaderPatcher->fragment_program_cache.emplace(key, *fragmentProgram);
+    if (vertexProgram)
+        warm_program_pair(emuenv, *shaderPatcher, vertexProgram.address(), fp->renderer_binding);
 
     return 0;
 }
@@ -4957,6 +5020,13 @@ EXPORT(int, sceGxmShaderPatcherCreateVertexProgram, SceGxmShaderPatcher *shaderP
     vp->renderer_data = std::move(renderer_data);
     vp->renderer_binding = make_vertex_program_binding(*vp, mem);
     gxm_program_register(vertexProgram->address(), GxmProgramKind::Vertex);
+
+    const auto pending = shaderPatcher->pending_warm.equal_range(programId->program.address());
+    for (auto it = pending.first; it != pending.second; ++it) {
+        if (const auto fragment = it->second.lock())
+            renderer::warm_pipeline(*emuenv.renderer, vp->renderer_binding, fragment);
+    }
+    shaderPatcher->pending_warm.erase(pending.first, pending.second);
 
     shaderPatcher->vertex_program_cache.emplace(key, *vertexProgram);
 
@@ -5559,27 +5629,25 @@ EXPORT(int, sceGxmTextureSetHeight, SceGxmTexture *texture, uint32_t height) {
     TRACY_FUNC(sceGxmTextureSetHeight, texture, height);
     if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    if (height > 4096)
+    if (height - 1 >= 4096)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
-    if ((texture->type << 29) == SCE_GXM_TEXTURE_TILED) {
-        if (texture->mip_count > 1) {
-            if (height >> (texture->mip_count - 1) >> 0x1F) {
-                goto LINEAR;
-            }
-        }
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
-    }
-
-    if (((texture->type << 29) != SCE_GXM_TEXTURE_SWIZZLED) && ((texture->type << 29) != SCE_GXM_TEXTURE_TILED)) {
-    LINEAR:
+    if (texture->texture_type() == SCE_GXM_TEXTURE_TILED) {
+        const uint32_t mip_count = (texture->mip_count + 1) & 15;
+        if ((height >> (mip_count ? mip_count - 1 : 0)) < 32)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
         texture->height = height - 1;
         return 0;
     }
 
-    // TODO: Add support for swizzled textures
-    LOG_WARN("Unimplemented texture format detected in sceGxmTextureSetHeight call.");
+    if (texture->texture_type() & 0xA0000000) {
+        texture->height = height - 1;
+        return 0;
+    }
 
+    if (height & (height - 1))
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_ALIGNMENT);
+    texture->height_base2 = std::bit_width(height) - 1;
     return 0;
 }
 
@@ -5714,7 +5782,12 @@ EXPORT(int, sceGxmTextureSetStride, SceGxmTexture *texture, uint32_t byteStride)
     if ((byteStride < 4) || (byteStride > 131072))
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
 
-    return UNIMPLEMENTED();
+    const uint32_t stride_compressed = (byteStride >> 2) - 1;
+    texture->mip_filter = stride_compressed & 1;
+    texture->min_filter = (stride_compressed & 0b0000110) >> 1;
+    texture->mip_count = (stride_compressed & 0b1111000) >> 3;
+    texture->lod_bias = (stride_compressed & 0b1111110000000) >> 7;
+    return 0;
 }
 
 static bool verify_texture_mode(SceGxmTexture *texture, SceGxmTextureAddrMode mode) {
@@ -5799,30 +5872,27 @@ EXPORT(int, sceGxmTextureSetVAddrModeSafe, SceGxmTexture *texture, SceGxmTexture
 
 EXPORT(int, sceGxmTextureSetWidth, SceGxmTexture *texture, uint32_t width) {
     TRACY_FUNC(sceGxmTextureSetWidth, texture, width);
-    if (!texture) {
+    if (!texture)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
-    } else if (width > 4096) {
+    if (width - 1 >= 4096)
         return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
-    }
 
-    if ((texture->type << 29) == SCE_GXM_TEXTURE_TILED) {
-        if (texture->mip_count > 1) {
-            if (width >> (texture->mip_count - 1) >> 0x1F) {
-                goto LINEAR;
-            }
-        }
-        return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
-    }
-
-    if (((texture->type << 29) != SCE_GXM_TEXTURE_SWIZZLED) && ((texture->type << 29) != SCE_GXM_TEXTURE_TILED)) {
-    LINEAR:
+    if (texture->texture_type() == SCE_GXM_TEXTURE_TILED) {
+        const uint32_t mip_count = (texture->mip_count + 1) & 15;
+        if ((width >> (mip_count ? mip_count - 1 : 0)) < 32)
+            return RET_ERROR(SCE_GXM_ERROR_INVALID_VALUE);
         texture->width = width - 1;
         return 0;
     }
 
-    // TODO: Add support for swizzled textures
-    LOG_WARN("Unimplemented texture format detected in sceGxmTextureSetWidth call.");
+    if (texture->texture_type() & 0xA0000000) {
+        texture->width = width - 1;
+        return 0;
+    }
 
+    if (width & (width - 1))
+        return RET_ERROR(SCE_GXM_ERROR_INVALID_ALIGNMENT);
+    texture->width_base2 = std::bit_width(width) - 1;
     return 0;
 }
 
@@ -6065,8 +6135,10 @@ EXPORT(int, sceGxmUnmapMemory, Ptr<void> base) {
     }
 
     // The renderer-side handler stops the world for the transition (see creation.cpp).
-    if (emuenv.renderer->features.enable_memory_mapping && ite->second.size > 0)
+    if (emuenv.renderer->features.enable_memory_mapping && ite->second.size > 0) {
+        guest_sched_release_for_block();
         renderer::send_single_command(*emuenv.renderer, nullptr, renderer::CommandOpcode::MemoryUnmap, true, aligned_base, static_cast<uint32_t>(thread_id));
+    }
 
     emuenv.gxm.memory_mapped_regions.erase(ite);
     return 0;
@@ -6093,5 +6165,8 @@ EXPORT(Ptr<const SceGxmProgram>, sceGxmVertexProgramGetProgram, const SceGxmVert
 
 EXPORT(int, sceGxmWaitEvent) {
     TRACY_FUNC(sceGxmWaitEvent);
-    return UNIMPLEMENTED();
+    thread_local uint64_t seen = 0;
+    guest_sched_release_for_block();
+    seen = renderer::wait_gpu_event(seen, 5);
+    return 0;
 }

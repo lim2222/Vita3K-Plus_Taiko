@@ -34,6 +34,7 @@ public final class InputOverlayDrawableButton
   private BitmapDrawable mDefaultStateBitmap;
   private BitmapDrawable mPressedStateBitmap;
   private BitmapDrawable mThirdStateBitmap = null;
+  private BitmapDrawable mTiltStateBitmap = null;
   private boolean mPressedState = false;
   private int mTouchSwitchState = 0;  // 0 = front, 1 = back, 2 = front+back
   private int mRole = 0;
@@ -156,6 +157,24 @@ private float mScaleAtEditStart = 1.0f;
     mThirdStateBitmap.setBounds(mDefaultStateBitmap.getBounds());
   }
 
+  public void setTiltStateBitmap(Resources res, Bitmap bitmap)
+  {
+    mTiltStateBitmap = new BitmapDrawable(res, Bitmap.createScaledBitmap(bitmap, mWidth, mHeight, true));
+    mTiltStateBitmap.setBounds(mDefaultStateBitmap.getBounds());
+    mTiltStateBitmap.setAlpha(mDefaultStateBitmap.getAlpha());
+  }
+
+  public int getTouchSwitchStateCount()
+  {
+    return mTiltStateBitmap != null ? 4 : (mThirdStateBitmap != null ? 3 : 2);
+  }
+
+  public void setTouchSwitchState(int state)
+  {
+    mTouchSwitchState = state;
+    mPressedState = state == 1;
+  }
+
   public void onConfigureTouch(MotionEvent event)
   {
     switch (event.getAction())
@@ -194,6 +213,7 @@ private float mScaleAtEditStart = 1.0f;
       {
         case 1: return mPressedStateBitmap;
         case 2: return mThirdStateBitmap;
+        case 3: return mTiltStateBitmap;
         default: return mDefaultStateBitmap;
       }
     }
@@ -206,6 +226,8 @@ private float mScaleAtEditStart = 1.0f;
     mPressedStateBitmap.setBounds(left, top, right, bottom);
     if (mThirdStateBitmap != null)
       mThirdStateBitmap.setBounds(left, top, right, bottom);
+    if (mTiltStateBitmap != null)
+      mTiltStateBitmap.setBounds(left, top, right, bottom);
   }
 
   public void setOpacity(int value)
@@ -215,6 +237,8 @@ private float mScaleAtEditStart = 1.0f;
     mPressedStateBitmap.setAlpha(adjustedValue);
     if (mThirdStateBitmap != null)
       mThirdStateBitmap.setAlpha(adjustedValue);
+    if (mTiltStateBitmap != null)
+      mTiltStateBitmap.setAlpha(adjustedValue);
   }
 
   public void setEditModeAlphaMultiplier(float multiplier)
@@ -241,7 +265,7 @@ private float mScaleAtEditStart = 1.0f;
   {
     if(mRole == InputOverlay.OVERLAY_MASK_TOUCH_SCREEN_SWITCH){
       if(isPressed){
-        mTouchSwitchState = (mTouchSwitchState + 1) % (mThirdStateBitmap != null ? 3 : 2);
+        mTouchSwitchState = (mTouchSwitchState + 1) % getTouchSwitchStateCount();
         mPressedState = mTouchSwitchState == 1;
       }
     } else {

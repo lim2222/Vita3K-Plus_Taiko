@@ -32,8 +32,10 @@
 #include <util/hash.h>
 #include <util/log.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <set>
@@ -44,12 +46,49 @@
 
 #include <SDL3/SDL_cpuinfo.h>
 
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 // don't use the dispatch version, because we always hash a small amount
 // with a known size
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
 namespace renderer::vulkan {
+
+static constexpr bool probe_before_defer = true;
+static constexpr bool warm_at_program_creation = true;
+static constexpr bool sync_new_surface_draws = false; // the surface was not drawn to in the last 60 frames (off: the main scene counts as new after a loading screen so a level's first frame froze for seconds on a cold cache)
+static constexpr bool sync_depth_stencil_writers = false; // the draw writes depth or stencil (off: nearly every new pipeline of a 3D game does so async would almost never defer)
+static constexpr bool save_in_background = true;
+
+namespace {
+uint64_t now_s() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+uint64_t warm_pair_key(const Sha256Hash &vertex, const Sha256Hash &fragment, SceGxmOutputRegisterFormat output_format) {
+    std::array<uint8_t, 68> data;
+    memcpy(data.data(), vertex.data(), 32);
+    memcpy(data.data() + 32, fragment.data(), 32);
+    const uint32_t format = static_cast<uint32_t>(output_format);
+    memcpy(data.data() + 64, &format, sizeof(format));
+    return XXH3_64bits(data.data(), data.size());
+}
+
+// a skipped draw that writes depth or stencil changes what the later draws of the frame show
+bool writes_depth_or_stencil(const GxmRecordState &record) {
+    const bool two_sided = record.two_sided == SCE_GXM_TWO_SIDED_ENABLED;
+    const auto stencil_writes = [](const GxmStencilStateOp &op) {
+        return op.stencil_fail != SCE_GXM_STENCIL_OP_KEEP || op.depth_fail != SCE_GXM_STENCIL_OP_KEEP || op.depth_pass != SCE_GXM_STENCIL_OP_KEEP;
+    };
+    return record.front_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED || (two_sided && record.back_depth_write_mode == SCE_GXM_DEPTH_WRITE_ENABLED)
+        || stencil_writes(record.front_stencil_state_op) || (two_sided && stencil_writes(record.back_stencil_state_op));
+}
+} // namespace
 
 // Size of the record containing what is needed for the pipeline construction (what is after is dynamic state)
 constexpr size_t record_pipeline_len = offsetof(GxmRecordState, vertex_streams);
@@ -103,6 +142,11 @@ void PipelineCache::init(bool support_rasterized_order_access) {
     vk::PipelineCacheCreateInfo pipeline_info{};
     pipeline_cache = state.device.createPipelineCache(pipeline_info);
 
+    if (state.features.vertex_store_slots > 0) {
+        const shader::usse::SpirvCode code = shader::generate_vertex_store_fragment_shader(state.features.vertex_store_slots);
+        vertex_store_fragment_module = state.device.createShaderModule(vk::ShaderModuleCreateInfo{ .codeSize = code.size() * sizeof(uint32_t), .pCode = code.data() });
+    }
+
     // the layout for uniforms buffer can be made here as it will always be the same
     {
         std::array<vk::DescriptorSetLayoutBinding, 4> layout_bindings;
@@ -145,7 +189,7 @@ void PipelineCache::init(bool support_rasterized_order_access) {
     {
         // layout for the mask, color attachment as input, being an input attachment or a storage image
         // depending on whether or not we are using shader interlock
-        std::array<vk::DescriptorSetLayoutBinding, 3> layout_binding;
+        std::array<vk::DescriptorSetLayoutBinding, 4> layout_binding;
         const vk::DescriptorType intput_image_descriptor = state.features.support_shader_interlock
             ? vk::DescriptorType::eStorageImage
             : vk::DescriptorType::eInputAttachment;
@@ -168,6 +212,13 @@ void PipelineCache::init(bool support_rasterized_order_access) {
             layout_binding[binding_count++] = vk::DescriptorSetLayoutBinding{
                 .binding = 2,
                 .descriptorType = intput_image_descriptor,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eFragment
+            };
+        if (state.features.support_shader_interlock)
+            layout_binding[binding_count++] = vk::DescriptorSetLayoutBinding{
+                .binding = 3,
+                .descriptorType = vk::DescriptorType::eStorageBuffer,
                 .descriptorCount = 1,
                 .stageFlags = vk::ShaderStageFlagBits::eFragment
             };
@@ -285,6 +336,18 @@ void PipelineCache::init(bool support_rasterized_order_access) {
         use_async_compilation = false;
         set_async_compilation(true);
     }
+
+    support_cache_only_creation = state.support_pipeline_cache_control;
+    if (warm_at_program_creation) {
+        warm_render_pass = retrieve_render_pass(vk::Format::eR8G8B8A8Unorm, true, true, true, false);
+        if (state.features.support_shader_interlock)
+            warm_interlock_render_pass = retrieve_render_pass(vk::Format::eR8G8B8A8Unorm, true, true, true, false, true);
+        const int warm_thread_count = std::clamp(nb_worker_threads, 1, 2);
+        warm_threads.reserve(warm_thread_count);
+        for (int i = 0; i < warm_thread_count; i++)
+            warm_threads.emplace_back(&PipelineCache::warm_thread, this, std::ref(*state.mem));
+        warm_enabled = true;
+    }
 }
 
 void PipelineCache::set_async_compilation(bool enable) {
@@ -396,6 +459,46 @@ void PipelineCache::read_pipeline_cache() {
 }
 
 void PipelineCache::save_pipeline_cache() {
+    wait_for_background_save();
+    std::vector<uint64_t> keys;
+    keys.reserve(pipelines.size());
+    for (const auto &[hash, _] : pipelines)
+        keys.push_back(hash);
+    write_pipeline_cache(keys);
+}
+
+void PipelineCache::save_pipeline_cache_async() {
+    if (!save_in_background) {
+        save_pipeline_cache();
+        return;
+    }
+    if (save_running) {
+        // the previous save is still writing, try again shortly
+        next_pipeline_cache_save = now_s() + 2;
+        return;
+    }
+    wait_for_background_save();
+    std::vector<uint64_t> keys;
+    keys.reserve(pipelines.size());
+    for (const auto &[hash, _] : pipelines)
+        keys.push_back(hash);
+    save_running = true;
+    save_thread = std::thread([this, keys = std::move(keys)]() {
+        try {
+            write_pipeline_cache(keys);
+        } catch (const std::exception &error) {
+            LOG_ERROR("Could not save the pipeline cache: {}", error.what());
+        }
+        save_running = false;
+    });
+}
+
+void PipelineCache::wait_for_background_save() {
+    if (save_thread.joinable())
+        save_thread.join();
+}
+
+void PipelineCache::write_pipeline_cache(const std::vector<uint64_t> &keys) {
     // first save the shader hashes
     // do a copy for thread safety
     std::vector<ShadersHash> shader_cache_copy;
@@ -424,8 +527,8 @@ void PipelineCache::save_pipeline_cache() {
         pipeline_cache_file.write(reinterpret_cast<const char *>(&val), sizeof(T));
     };
     write_integer(pipeline_cache_magic);
-    write_integer(pipelines.size());
-    for (auto &[hash, _] : pipelines) {
+    write_integer(keys.size());
+    for (const uint64_t hash : keys) {
         write_integer(hash);
     }
 
@@ -436,6 +539,19 @@ void PipelineCache::save_pipeline_cache() {
 }
 
 void PipelineCache::cleanup() {
+    stop_warm_threads();
+    wait_for_background_save();
+    warm_render_pass = nullptr;
+    warm_interlock_render_pass = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(warm_mutex);
+        warm_pairs_requested.clear();
+        pairs_drawn.clear();
+        warm_states.clear();
+    }
+    draw_states.clear();
+    draw_states_total = 0;
+
     // stop threads (queued requests are abandoned at shutdown)
     if (use_async_compilation) {
         use_async_compilation = false;
@@ -472,6 +588,8 @@ void PipelineCache::cleanup() {
             pipeline_layouts[i][j] = nullptr;
         }
 
+    state.device.destroy(vertex_store_fragment_module);
+    vertex_store_fragment_module = nullptr;
     state.device.destroy(uniforms_layout);
     uniforms_layout = nullptr;
     state.device.destroy(attachments_layout);
@@ -517,14 +635,17 @@ static const vk::SpecializationInfo frag_spec_infos[4] = {
     { .mapEntryCount = 2, .pMapEntries = frag_spec_entries, .dataSize = sizeof(frag_spec_data[3]), .pData = frag_spec_data[3] },
 };
 
-vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &base_hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb, bool has_casts) {
-    if (maskupdate)
-        LOG_WARN_ONCE("Mask not implemented in the vulkan renderer!");
+static const vk::SpecializationMapEntry frag_mirror_spec_entries[] = {
+    { .constantID = shader::GAMMA_CORRECTION_SPECIALIZATION_ID, .offset = 0, .size = sizeof(uint32_t) },
+    { .constantID = shader::SURFACE_CAST_SPECIALIZATION_ID, .offset = sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = shader::DEPTH_MIRROR_FUNC_SPECIALIZATION_ID, .offset = 2 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+    { .constantID = shader::DEPTH_MIRROR_WRITE_SPECIALIZATION_ID, .offset = 3 * sizeof(uint32_t), .size = sizeof(uint32_t) },
+};
 
+static Sha256Hash shader_cache_key(const SceGxmProgram *program, const Sha256Hash &base_hash, bool is_vertex, const shader::Hints &hints, const FeatureState &features, std::string &version_suffix) {
     // A one-channel surface moves a different component into the stored channel, so it needs its own cache entry
     const int one_channel_source = is_vertex ? -1 : gxm::one_channel_source_component(hints.color_format);
     Sha256Hash hash = base_hash;
-    std::string version_suffix;
     if (one_channel_source > 0) {
         hash[0] ^= static_cast<uint8_t>(0xC0 + one_channel_source);
         version_suffix = fmt::format("c{}", one_channel_source);
@@ -543,12 +664,38 @@ vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmPro
         hash[6] ^= 0x75;
         version_suffix += "u";
     }
+    if (is_vertex && shader::emulates_vertex_stores(*program, features)) {
+        hash[7] ^= hints.vertex_store_pass ? 0x5E : 0x4E;
+        version_suffix += hints.vertex_store_pass ? fmt::format("w{}", features.vertex_store_slots) : std::string("n");
+    }
+    return hash;
+}
+
+vk::PipelineShaderStageCreateInfo PipelineCache::retrieve_shader(const SceGxmProgram *program, const Sha256Hash &base_hash, bool is_vertex, bool maskupdate, MemState &mem, const shader::Hints &hints, bool is_srgb, bool has_casts, bool ready_only) {
+    if (maskupdate)
+        LOG_WARN_ONCE("Mask not implemented in the vulkan renderer!");
+
+    std::string version_suffix;
+    const Sha256Hash hash = shader_cache_key(program, base_hash, is_vertex, hints, state.features, version_suffix);
 
     const vk::ShaderModule shader_compiling = std::bit_cast<vk::ShaderModule>(~0ULL);
 
     // entries for constants a module does not declare are ignored, and is_srgb is only declared along shader interlock
     const bool srgb = is_srgb && state.features.should_use_shader_interlock() && program->is_frag_color_used();
     const vk::SpecializationInfo *spec_info = is_vertex ? nullptr : &frag_spec_infos[(srgb ? 2 : 0) | (has_casts ? 1 : 0)];
+
+    if (ready_only) {
+        std::lock_guard<std::mutex> guard(shaders_mutex);
+        const auto found = shaders.find(hash);
+        if (found == shaders.end() || found->second == nullptr || found->second == shader_compiling)
+            return {};
+        return vk::PipelineShaderStageCreateInfo{
+            .stage = is_vertex ? vk::ShaderStageFlagBits::eVertex : vk::ShaderStageFlagBits::eFragment,
+            .module = found->second,
+            .pName = is_vertex ? "main_vs" : "main_fs",
+            .pSpecializationInfo = spec_info,
+        };
+    }
 
     vk::ShaderModule *shader_module;
     {
@@ -990,6 +1137,72 @@ std::string PipelineCache::describe_shader(const Sha256Hash &hash) {
     return describe_spirv_module(source.data(), source.size());
 }
 
+namespace {
+struct AttributeFetch {
+    vk::Format format;
+    // TODO: add support for matrix input for non-regformated attributes
+    uint32_t array_size = 1;
+    uint32_t array_element_size = 0;
+    uint32_t component_size = 0;
+    uint32_t size = 0;
+};
+
+AttributeFetch attribute_fetch(const SceGxmVertexAttribute &attribute, shader::usse::AttributeInformation info, const bool support_scaled_vertex_attribute, const std::set<vk::Format> &unsupported_rgb_vertex_attribute_formats) {
+    AttributeFetch fetch{};
+    SceGxmAttributeFormat attribute_format = attribute.format;
+    uint8_t component_count = attribute.componentCount;
+    if (info.regformat) {
+        component_count = info.component_count;
+        switch (info.gxm_type) {
+        case SCE_GXM_PARAMETER_TYPE_U8:
+        case SCE_GXM_PARAMETER_TYPE_S8:
+        case SCE_GXM_PARAMETER_TYPE_C10:
+            attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
+            break;
+        case SCE_GXM_PARAMETER_TYPE_U16:
+        case SCE_GXM_PARAMETER_TYPE_S16:
+        case SCE_GXM_PARAMETER_TYPE_F16:
+            attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U16;
+            break;
+        default:
+            // U32 format
+            attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
+            break;
+        }
+
+        if (info.gxm_type == SCE_GXM_PARAMETER_TYPE_C10)
+            component_count = (component_count * 10 + 7) / 8;
+
+        if (component_count > 4) {
+            fetch.array_size = (component_count + 3) / 4;
+            fetch.array_element_size = 4 * gxm::attribute_format_size(attribute_format);
+            component_count = 4;
+        }
+
+        fetch.format = translate_attribute_format(attribute_format, component_count, true, false);
+        if (component_count == 3 && unsupported_rgb_vertex_attribute_formats.contains(fetch.format)) {
+            component_count = 4;
+            fetch.format = translate_attribute_format(attribute_format, component_count, true, false);
+        }
+    } else {
+        // some Android GPUs do not support scaled attributes (so do the conversion in the GPU instead)
+        if (!support_scaled_vertex_attribute)
+            info.is_integer = true;
+
+        // some AMD GPUs do not seem to support rgb vertex attributes
+        fetch.format = translate_attribute_format(attribute_format, component_count, info.is_integer, info.is_signed);
+        if (component_count == 3 && unsupported_rgb_vertex_attribute_formats.contains(fetch.format)) {
+            component_count = 4;
+            fetch.format = translate_attribute_format(attribute_format, component_count, info.is_integer, info.is_signed);
+        }
+    }
+
+    fetch.component_size = gxm::attribute_format_size(attribute_format);
+    fetch.size = (fetch.array_size - 1) * fetch.array_element_size + component_count * fetch.component_size;
+    return fetch;
+}
+} // namespace
+
 vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(const ProgramBinding &vertex_program) {
     // pointer to these objects are returned (so it needs to be static)
     // and each thread needs one (hence the thread_local)
@@ -1002,85 +1215,33 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
     VertexProgram *vkvert = vertex_program.vertex_program.get();
 
     uint32_t used_streams = 0;
+    for (const SceGxmVertexAttribute &attribute : vertex_program.attributes) {
+        if (vkvert->attribute_infos.contains(attribute.regIndex))
+            used_streams |= (1 << attribute.streamIndex);
+    }
+    std::array<VertexStreamLayout, SCE_GXM_MAX_VERTEX_STREAMS> layouts;
+    for (uint32_t stream_index = 0; stream_index < SCE_GXM_MAX_VERTEX_STREAMS; stream_index++) {
+        if (used_streams & (1 << stream_index))
+            layouts[stream_index] = vertex_stream_layout(vertex_program, stream_index);
+    }
 
     const bool attribute_bindings = needs_attribute_bindings(vertex_program);
     const auto add_binding = [&](uint32_t binding, uint32_t stream_index) {
         const SceGxmVertexStream &stream = vertex_program.streams[stream_index];
         const bool is_instanced = gxm::is_stream_instancing(static_cast<SceGxmIndexSource>(stream.indexSource));
-        const uint32_t stride = needs_restride(vertex_program, stream_index) ? align(stream.stride, 4) : stream.stride;
         binding_descr.push_back(vk::VertexInputBindingDescription{
             .binding = binding,
-            .stride = stride,
+            .stride = layouts[stream_index].stride,
             .inputRate = is_instanced ? vk::VertexInputRate::eInstance : vk::VertexInputRate::eVertex });
     };
 
-    for (const SceGxmVertexAttribute &attribute : vertex_program.attributes) {
+    for (size_t a = 0; a < vertex_program.attributes.size(); a++) {
+        const SceGxmVertexAttribute &attribute = vertex_program.attributes[a];
         if (!vkvert->attribute_infos.contains(attribute.regIndex))
             continue;
 
-        used_streams |= (1 << attribute.streamIndex);
-
-        SceGxmAttributeFormat attribute_format = attribute.format;
-        shader::usse::AttributeInformation info = vkvert->attribute_infos.at(attribute.regIndex);
-
-        uint8_t component_count = attribute.componentCount;
-        // these 2 values are only used when a matrix is used as a vertex attribute
-        // this is only supported for regformated attribute for now
-        // TODO: add support for matrix input for non-regformated attributes
-        uint32_t array_size = 1;
-        uint32_t array_element_size = 0;
-        vk::Format format;
-        if (info.regformat) {
-            // use the data from the shader itself
-            component_count = info.component_count;
-            switch (info.gxm_type) {
-            case SCE_GXM_PARAMETER_TYPE_U8:
-            case SCE_GXM_PARAMETER_TYPE_S8:
-            case SCE_GXM_PARAMETER_TYPE_C10:
-                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U8;
-                break;
-            case SCE_GXM_PARAMETER_TYPE_U16:
-            case SCE_GXM_PARAMETER_TYPE_S16:
-            case SCE_GXM_PARAMETER_TYPE_F16:
-                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_U16;
-                break;
-            default:
-                // U32 format
-                attribute_format = SCE_GXM_ATTRIBUTE_FORMAT_UNTYPED;
-                break;
-            }
-
-            if (info.gxm_type == SCE_GXM_PARAMETER_TYPE_C10)
-                // this is 10-bit and not 8-bit
-                component_count = (component_count * 10 + 7) / 8;
-
-            if (component_count > 4) {
-                // a matrix is used as an attribute, pack everything into an array of vec4
-                array_size = (component_count + 3) / 4;
-                array_element_size = 4 * gxm::attribute_format_size(attribute_format);
-                component_count = 4;
-            }
-
-            // regformat attributes are int32
-            format = translate_attribute_format(attribute_format, component_count, true, false);
-            if (component_count == 3 && unsupported_rgb_vertex_attribute_formats.contains(format)) {
-                component_count = 4;
-                format = translate_attribute_format(attribute_format, component_count, true, false);
-            }
-        } else {
-            // some Android GPUs do not support scaled attributes, do the conversion in the GPU instead
-            if (!support_scaled_vertex_attribute)
-                info.is_integer = true;
-
-            // some AMD GPUs do not support rgb vertex attributes, so just put it as rgba
-            // the 4th component will contain garbage but this is not an issue because the input
-            // in the shader will be vec3 (or ivec3) and the 4th component will be discarded
-            format = translate_attribute_format(attribute_format, component_count, info.is_integer, info.is_signed);
-            if (component_count == 3 && unsupported_rgb_vertex_attribute_formats.contains(format)) {
-                component_count = 4;
-                format = translate_attribute_format(attribute_format, component_count, info.is_integer, info.is_signed);
-            }
-        }
+        const shader::usse::AttributeInformation &info = vkvert->attribute_infos.at(attribute.regIndex);
+        const AttributeFetch fetch = attribute_fetch(attribute, info, support_scaled_vertex_attribute, unsupported_rgb_vertex_attribute_formats);
 
         uint32_t binding = attribute.streamIndex;
         if (attribute_bindings) {
@@ -1088,12 +1249,13 @@ vk::PipelineVertexInputStateCreateInfo PipelineCache::get_vertex_input_state(con
             add_binding(binding, attribute.streamIndex);
         }
 
-        for (uint32_t i = 0; i < array_size; i++) {
+        const uint32_t offset = a < VertexStreamLayout::MAX_ATTRIBUTES ? layouts[attribute.streamIndex].offsets[a] : attribute.offset;
+        for (uint32_t i = 0; i < fetch.array_size; i++) {
             attr_descr.push_back(vk::VertexInputAttributeDescription{
                 .location = info.location + i,
                 .binding = binding,
-                .format = format,
-                .offset = (attribute_bindings ? 0 : attribute.offset) + i * array_element_size });
+                .format = fetch.format,
+                .offset = (attribute_bindings ? 0 : offset) + i * fetch.array_element_size });
         }
     }
 
@@ -1127,45 +1289,65 @@ bool PipelineCache::needs_attribute_bindings(const ProgramBinding &vertex_progra
     return false;
 }
 
-static uint32_t attribute_component_size(const SceGxmVertexAttribute &attribute, const shader::usse::AttributeInformation &info) {
-    if (!info.regformat)
-        return gxm::attribute_format_size(attribute.format);
-
-    switch (info.gxm_type) {
-    case SCE_GXM_PARAMETER_TYPE_U8:
-    case SCE_GXM_PARAMETER_TYPE_S8:
-    case SCE_GXM_PARAMETER_TYPE_C10:
-        return 1;
-    case SCE_GXM_PARAMETER_TYPE_U16:
-    case SCE_GXM_PARAMETER_TYPE_S16:
-    case SCE_GXM_PARAMETER_TYPE_F16:
-        return 2;
-    default:
-        return 4;
-    }
-}
-
-bool PipelineCache::needs_restride(const ProgramBinding &vertex_program, const uint32_t stream_index) const {
+VertexStreamLayout PipelineCache::vertex_stream_layout(const ProgramBinding &vertex_program, const uint32_t stream_index) const {
+    VertexStreamLayout layout;
     const uint32_t stride = vertex_program.streams[stream_index].stride;
-    if (stride % 4 == 0)
-        return false;
+    layout.stride = stride;
 
+    struct Item {
+        uint32_t index;
+        uint32_t offset;
+        uint32_t size;
+        uint32_t align;
+    };
+    std::array<Item, VertexStreamLayout::MAX_ATTRIBUTES> items;
+    uint32_t count = 0;
 #ifdef __APPLE__
     // Metal only takes a stride that is a multiple of 4
-    return true;
+    bool unaligned = stride % 4 != 0;
 #else
-    // Vulkan wants each attribute address to be a multiple of the component size of its format (so fine at any stride)
+    bool unaligned = false;
+#endif
     const VertexProgram *vkvert = vertex_program.vertex_program.get();
-    for (const SceGxmVertexAttribute &attribute : vertex_program.attributes) {
+    for (size_t a = 0; a < vertex_program.attributes.size() && a < VertexStreamLayout::MAX_ATTRIBUTES; a++) {
+        const SceGxmVertexAttribute &attribute = vertex_program.attributes[a];
+        layout.offsets[a] = attribute.offset;
         if (attribute.streamIndex != stream_index)
             continue;
 
         const auto it = vkvert->attribute_infos.find(attribute.regIndex);
-        if (it != vkvert->attribute_infos.end() && stride % attribute_component_size(attribute, it->second) != 0)
-            return true;
+        if (it == vkvert->attribute_infos.end())
+            continue;
+
+        const AttributeFetch fetch = attribute_fetch(attribute, it->second, support_scaled_vertex_attribute, unsupported_rgb_vertex_attribute_formats);
+        items[count++] = { static_cast<uint32_t>(a), attribute.offset, fetch.size, fetch.component_size };
+        unaligned |= attribute.offset % fetch.component_size != 0 || stride % fetch.component_size != 0;
     }
-    return false;
-#endif
+    if (!unaligned)
+        return layout;
+
+    std::sort(items.begin(), items.begin() + count, [](const Item &l, const Item &r) { return l.offset != r.offset ? l.offset < r.offset : l.size > r.size; });
+    VertexStreamLayout::Copy block{};
+    uint32_t delta = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        const Item &item = items[k];
+        if (k > 0 && (item.offset + delta) % item.align == 0) {
+            block.size = std::max(block.size, item.offset + item.size - block.src);
+        } else {
+            if (k > 0)
+                layout.copies[layout.copy_count++] = block;
+            const uint32_t dst = align(std::max(layout.record_size, static_cast<uint32_t>(item.offset)), item.align);
+            delta = dst - item.offset;
+            block = { item.offset, dst, item.size };
+        }
+        layout.offsets[item.index] = item.offset + delta;
+        layout.record_size = std::max(layout.record_size, block.dst + block.size);
+    }
+    if (count > 0)
+        layout.copies[layout.copy_count++] = block;
+    layout.stride = stride == 0 ? 0 : align(std::max(layout.record_size, stride), 4);
+    layout.repack = true;
+    return layout;
 }
 
 void PipelineCache::compiler_thread(MemState &mem) {
@@ -1213,7 +1395,7 @@ static vk::StencilOpState convert_op_state(const GxmStencilStateOp &state) {
     };
 }
 
-vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const ProgramBinding &vertex_program_binding, const ProgramBinding &fragment_program_binding, const GxmRecordState &record, bool has_color_surface_data, const shader::Hints &hints, bool has_casts, MemState &mem) try {
+vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::RenderPass render_pass, const ProgramBinding &vertex_program_binding, const ProgramBinding &fragment_program_binding, const GxmRecordState &record, bool has_color_surface_data, const shader::Hints &hints, bool has_casts, MemState &mem, bool cache_only) try {
     const VertexProgram &vertex_program = *vertex_program_binding.vertex_program;
     const SceGxmProgram *gxm_fragment_shader = fragment_program_binding.program();
     const VKFragmentProgram &fragment_program = *reinterpret_cast<VKFragmentProgram *>(
@@ -1228,23 +1410,29 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     shader::Hints fragment_hints = hints;
     fragment_hints.raw_color_attachment_input = with_raw_attachment && state.features.direct_fragcolor && gxm_fragment_shader->is_frag_color_used();
 
-    const vk::PipelineShaderStageCreateInfo vertex_shader = retrieve_shader(vertex_program_binding.program(), vertex_program.hash, true, fragment_program_binding.is_maskupdate, mem, hints);
-    const vk::PipelineShaderStageCreateInfo fragment_shader = retrieve_shader(gxm_fragment_shader, fragment_program.hash, false, fragment_program_binding.is_maskupdate, mem, fragment_hints, record.is_gamma_corrected, has_casts);
-    const vk::PipelineShaderStageCreateInfo shader_stages[] = { vertex_shader, fragment_shader };
+    const bool vertex_stores = hints.vertex_store_pass && shader::emulates_vertex_stores(*vertex_program_binding.program(), state.features);
+    const vk::PipelineShaderStageCreateInfo vertex_shader = retrieve_shader(vertex_program_binding.program(), vertex_program.hash, true, fragment_program_binding.is_maskupdate, mem, hints, false, false, cache_only);
+    const vk::PipelineShaderStageCreateInfo fragment_shader = vertex_stores
+        ? vk::PipelineShaderStageCreateInfo{ .stage = vk::ShaderStageFlagBits::eFragment, .module = vertex_store_fragment_module, .pName = "main_fs" }
+        : retrieve_shader(gxm_fragment_shader, fragment_program.hash, false, fragment_program_binding.is_maskupdate, mem, fragment_hints, record.is_gamma_corrected, has_casts, cache_only);
+    if (cache_only && (!vertex_shader.module || !fragment_shader.module))
+        // a cache-only request never translates a shader on the calling thread
+        return nullptr;
+    vk::PipelineShaderStageCreateInfo shader_stages[] = { vertex_shader, fragment_shader };
     // disable the fragment shader if gxm asks us to
-    const bool is_fragment_disabled = record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED || gxm_fragment_shader->has_no_effect();
+    const bool is_fragment_disabled = !vertex_stores && (record.front_side_fragment_program_mode == SCE_GXM_FRAGMENT_PROGRAM_DISABLED || gxm_fragment_shader->has_no_effect());
     const uint32_t shader_stage_count = is_fragment_disabled ? 1U : 2U;
 
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly{
-        .topology = translate_primitive(type)
+        .topology = vertex_stores ? vk::PrimitiveTopology::ePointList : translate_primitive(type)
     };
 
     const bool two_sided = (record.two_sided == SCE_GXM_TWO_SIDED_ENABLED);
 
     const vk::PipelineRasterizationStateCreateInfo rasterizer{
         .depthClampEnable = (enable_depth_clamp && state.physical_device_features.depthClamp) ? VK_TRUE : VK_FALSE,
-        .polygonMode = translate_polygon_mode(record.front_polygon_mode),
-        .cullMode = translate_cull_mode(record.cull_mode),
+        .polygonMode = vertex_stores ? vk::PolygonMode::eFill : translate_polygon_mode(record.front_polygon_mode),
+        .cullMode = vertex_stores ? vk::CullModeFlags() : translate_cull_mode(record.cull_mode),
         // front face is always counter clockwise
         .frontFace = vk::FrontFace::eCounterClockwise,
         .depthBiasEnable = VK_TRUE,
@@ -1261,25 +1449,43 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
         .depthCompareOp = translate_depth_func(record.front_depth_func),
         .depthBoundsTestEnable = VK_FALSE,
         .stencilTestEnable = VK_TRUE,
-        .front = convert_op_state(record.front_stencil_state_op),
-        .back = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op)
+        // GXM gives its front two-sided state to clockwise triangles
+        .front = convert_op_state(two_sided ? record.back_stencil_state_op : record.front_stencil_state_op),
+        .back = convert_op_state(record.front_stencil_state_op)
     };
     if (fetch_draw_stops_lrz_write(state, record, *gxm_fragment_shader)) {
         ds_info.front.compareOp = vk::CompareOp::eEqual;
         ds_info.front.failOp = vk::StencilOp::eKeep;
+    }
+    if (vertex_stores)
+        ds_info = vk::PipelineDepthStencilStateCreateInfo{};
+
+    std::array<uint32_t, 4> mirror_spec_data{};
+    vk::SpecializationInfo mirror_spec_info;
+    if (fragment_program.depth_mirror && !vertex_stores && fragment_shader.pSpecializationInfo) {
+        memcpy(mirror_spec_data.data(), fragment_shader.pSpecializationInfo->pData, sizeof(frag_spec_data[0]));
+        mirror_spec_data[2] = static_cast<uint32_t>(ds_info.depthCompareOp);
+        mirror_spec_data[3] = ds_info.depthWriteEnable;
+        mirror_spec_info = vk::SpecializationInfo{
+            .mapEntryCount = static_cast<uint32_t>(std::size(frag_mirror_spec_entries)),
+            .pMapEntries = frag_mirror_spec_entries,
+            .dataSize = sizeof(mirror_spec_data),
+            .pData = mirror_spec_data.data()
+        };
+        shader_stages[1].pSpecializationInfo = &mirror_spec_info;
     }
 
     vk::PipelineColorBlendStateCreateInfo color_blending{};
     if (support_coherent_framebuffer_fetch)
         color_blending.flags = vk::PipelineColorBlendStateCreateFlagBits::eRasterizationOrderAttachmentAccessEXT;
 
-    const bool frag_has_no_output = static_cast<bool>(gxm_fragment_shader->program_flags & SCE_GXM_PROGRAM_FLAG_OUTPUT_UNDEFINED);
+    const bool frag_has_no_output = gxm_fragment_shader->has_no_color_output();
     std::array<vk::PipelineColorBlendAttachmentState, 2> blend_attachments;
     blend_attachments[1] = vk::PipelineColorBlendAttachmentState{
         .blendEnable = VK_FALSE,
         .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
     };
-    if (is_fragment_disabled || frag_has_no_output || use_shader_interlock) {
+    if (is_fragment_disabled || frag_has_no_output || use_shader_interlock || vertex_stores) {
         // The write mask must be empty as the lack of a fragment shader results in undefined values
         blend_attachments[0] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = VK_FALSE,
@@ -1334,7 +1540,7 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
 
     // The stock Adreno driver can SIGSEGV inside createGraphicsPipeline
     // If the log ends on this line this exact vert/frag pair killed the driver's compiler
-    if (state.is_adreno_stock)
+    if (state.is_adreno_stock && !cache_only)
         LOG_INFO("[PIPE] stock-Adreno: compiling pipeline vert={} frag={} ({})", hex_string(vertex_program.hash),
             hex_string(fragment_program.hash), is_fragment_disabled ? "frag-disabled" : "frag-enabled");
 
@@ -1342,8 +1548,13 @@ vk::Pipeline PipelineCache::compile_pipeline(SceGxmPrimitiveType type, vk::Rende
     // the whole emulator down before the check below could run. Some drivers (notably Mesa/Turnip)
     // also report an internal shader-compiler rejection as ErrorOutOfHostMemory rather than a
     // specific error.
+    if (cache_only)
+        pipeline_info.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequiredEXT;
     try {
         const auto result = state.device.createGraphicsPipeline(pipeline_cache, pipeline_info);
+        if (result.result == vk::Result::ePipelineCompileRequiredEXT)
+            // not in the driver cache
+            return nullptr;
         if (result.result != vk::Result::eSuccess) {
             LOG_CRITICAL("Failed to create pipeline: {}", vk::to_string(result.result));
             return nullptr;
@@ -1553,7 +1764,7 @@ void PipelineCache::bisect_pipeline_failure(const vk::GraphicsPipelineCreateInfo
     LOG_CRITICAL("=== END KNOCKOUT BISECT ===");
 }
 
-vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem) {
+vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiveType &type, bool consider_for_async, MemState &mem, bool vertex_store_pass) {
     const GxmRecordState &record = context.record;
     uint64_t key = hash_pipeline_record(record);
     uint64_t raw_key = XXH3_64bits(&record, record_pipeline_len);
@@ -1583,8 +1794,12 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
         variant_bits |= static_cast<uint64_t>(key_one_channel) << 48;
     key ^= variant_bits;
     raw_key ^= variant_bits;
+    if (vertex_store_pass) {
+        key ^= 0x9E3779B97F4A7C15ull;
+        raw_key ^= 0x9E3779B97F4A7C15ull;
+    }
 
-    const uint32_t cast_units = context.curr_frag_ublock.cast_sampler_bits | context.curr_frag_ublock.raw_cast_bits;
+    const uint32_t cast_units = context.curr_frag_ublock.cast_sampler_bits | context.curr_frag_ublock.cast_phase_bits | context.curr_frag_ublock.raw_cast_bits;
     const bool has_casts = (cast_units & fragment_program_binding->fragment_program->textures_used.to_ulong()) != 0;
     if (has_casts) {
         key ^= 0xC2B2AE3D27D4EB4Full;
@@ -1606,8 +1821,14 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
                 return nullptr;
             if (raw_pipeline_keys_seen.insert(raw_key).second)
                 state.pipelines_redundant_avoided++;
-            if (it->second == pipeline_compiling)
-                return nullptr;
+            if (it->second == pipeline_compiling) {
+                // a worker is compiling it for an earlier draw (a draw that must not be skipped waits for it)
+                if (!use_async_compilation || !must_not_skip_draw(record, consider_for_async))
+                    return nullptr;
+                while (it->second == pipeline_compiling)
+                    std::this_thread::yield();
+                return it->second == pipeline_failed ? nullptr : it->second;
+            }
             return it->second;
         }
         already_in_cache = true;
@@ -1621,9 +1842,25 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
     const SceGxmProgram *gxm_fragment_shader = fragment_program_binding->program();
     const bool use_shader_interlock = state.features.support_shader_interlock && gxm_fragment_shader->is_frag_color_used();
     const vk::RenderPass render_pass = use_shader_interlock ? context.current_shader_interlock_pass : context.current_render_pass;
+
+    // the warm threads learn from it which draw states new pipelines use
+    const WarmState draw_state{
+        .color_format = static_cast<uint32_t>(record.color_surface.colorFormat),
+        .raw = state.features.preserve_f16_nan_as_u16 && !use_shader_interlock && record.color_base_format == SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16 && static_cast<bool>(record.color_surface.data),
+        .casts = has_casts,
+        .render_pass = context.current_render_pass,
+        .interlock_render_pass = context.current_shader_interlock_pass,
+    };
+    note_draw_state(draw_state);
+    const uint64_t draw_pair = warm_pair_key(vertex_program_binding->vertex_program->hash, fragment_program.hash, fragment_program.output_register_format);
+    {
+        std::lock_guard<std::mutex> guard(warm_mutex);
+        pairs_drawn.insert(draw_pair);
+    }
     // update the shader hints
     context.shader_hints.color_format = record.color_surface.colorFormat;
     context.shader_hints.attributes = &vertex_program_binding->attributes;
+    context.shader_hints.vertex_store_pass = vertex_store_pass;
     context.shader_hints.output_register_format = fragment_program_binding->fragment_program
         ? fragment_program_binding->fragment_program->output_register_format
         : SCE_GXM_OUTPUT_REGISTER_FORMAT_DECLARED;
@@ -1672,8 +1909,19 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
         }
     }
 
-    // note: the flag can_use_deferred_compilation is not considered here because it causes way too many false positives
-    const bool compile_pipeline_async = !already_in_cache && consider_for_async && use_async_compilation;
+    const bool compile_pipeline_async = !already_in_cache && use_async_compilation && !must_not_skip_draw(record, consider_for_async);
+
+    if (compile_pipeline_async && probe_before_defer && support_cache_only_creation) {
+        // the driver can already hold this pipeline, for example the same shaders with other render state, and then
+        // hands it over without compiling
+        const vk::Pipeline probed = compile_pipeline(type, render_pass, *vertex_program_binding, *fragment_program_binding, record, static_cast<bool>(record.color_surface.data), context.shader_hints, has_casts, mem, true);
+        if (probed) {
+            next_pipeline_cache_save = now_s() + pipeline_cache_save_delay;
+            state.shaders_count_compiled++;
+            it->second = probed;
+            return probed;
+        }
+    }
 
     if (compile_pipeline_async) {
         // create the pipeline compile request
@@ -1712,7 +1960,7 @@ vk::Pipeline PipelineCache::retrieve_pipeline(VKContext &context, SceGxmPrimitiv
 
 vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool search_first) try {
     if (search_first) {
-        // happens while loading the thread, no parallel access so no need for a mutex
+        std::lock_guard<std::mutex> guard(shaders_mutex);
         auto it = shaders.find(hash);
         if (it != shaders.end())
             return it->second;
@@ -1744,5 +1992,182 @@ vk::ShaderModule PipelineCache::precompile_shader(const Sha256Hash &hash, bool s
 } catch (const std::exception &error) {
     LOG_ERROR("Could not load cached shader {}: {}", hex_string(hash), error.what());
     return nullptr;
+}
+
+bool PipelineCache::must_not_skip_draw(const GxmRecordState &record, bool consider_for_async) const {
+    return !consider_for_async || (sync_new_surface_draws && !can_use_deferred_compilation) || (sync_depth_stencil_writers && writes_depth_or_stencil(record));
+}
+
+void PipelineCache::warm_program_pair(const std::shared_ptr<ProgramBinding> &vertex, const std::shared_ptr<ProgramBinding> &fragment) {
+    if (!warm_enabled || !vertex || !fragment || !vertex->vertex_program || !fragment->fragment_program || fragment->is_maskupdate)
+        return;
+    const uint64_t pair = warm_pair_key(vertex->vertex_program->hash, fragment->fragment_program->hash, fragment->fragment_program->output_register_format);
+    {
+        std::lock_guard<std::mutex> guard(warm_mutex);
+        if (!warm_pairs_requested.insert(pair).second)
+            return;
+    }
+    warm_queue.enqueue(new WarmRequest{ vertex, fragment, pair });
+}
+
+void PipelineCache::warm_thread(MemState &mem) {
+#if defined(__linux__)
+    // below the guest and render threads: this work only pays off later
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 10);
+#endif
+    while (true) {
+        WarmRequest *request = nullptr;
+        warm_queue.wait_dequeue(request);
+        if (!request)
+            break;
+        if (!warm_stopping)
+            warm_pair(*request, mem);
+        delete request;
+    }
+}
+
+void PipelineCache::stop_warm_threads() {
+    warm_enabled = false;
+    warm_stopping = true;
+    for (size_t i = 0; i < warm_threads.size(); i++)
+        warm_queue.enqueue(nullptr);
+    for (auto &thread : warm_threads) {
+        if (thread.joinable())
+            thread.join();
+    }
+    warm_threads.clear();
+    WarmRequest *request;
+    while (warm_queue.try_dequeue(request))
+        delete request;
+    warm_stopping = false;
+}
+
+bool PipelineCache::codegen_ignores_draw_hints(const SceGxmProgram &program, bool is_vertex, const shader::Hints &hints) {
+    struct Variant {
+        SceGxmTextureFormat texture;
+        SceGxmColorFormat color;
+        bool no_attributes;
+    };
+    static constexpr Variant variants[] = {
+        { SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR, false },
+        { SCE_GXM_TEXTURE_FORMAT_F32_R, SCE_GXM_COLOR_FORMAT_F16F16F16F16_ABGR, true },
+        { SCE_GXM_TEXTURE_FORMAT_F16F16_GR, SCE_GXM_COLOR_FORMAT_U5U6U5_BGR, true },
+        { SCE_GXM_TEXTURE_FORMAT_S16S16S16S16_ABGR, SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR, false },
+    };
+    static const std::vector<SceGxmVertexAttribute> no_attributes;
+    const bool vary_color = !is_vertex && !program.is_frag_color_used();
+    shader::usse::SpirvCode reference;
+    for (const Variant &variant : variants) {
+        shader::Hints variant_hints = hints;
+        std::fill_n(is_vertex ? variant_hints.vertex_textures : variant_hints.fragment_textures, SCE_GXM_MAX_TEXTURE_UNITS, variant.texture);
+        if (vary_color)
+            variant_hints.color_format = variant.color;
+        if (is_vertex && variant.no_attributes)
+            variant_hints.attributes = &no_attributes;
+        const shader::GeneratedShader generated = shader::convert_gxp(program, "warm", state.features, shader::Target::SpirVVulkan, variant_hints, false, false);
+        if (generated.spirv.empty())
+            return false;
+        if (reference.empty())
+            reference = generated.spirv;
+        else if (generated.spirv != reference)
+            return false;
+    }
+    return true;
+}
+
+bool PipelineCache::shader_available(const SceGxmProgram &program, const Sha256Hash &base_hash, bool is_vertex, const shader::Hints &hints) {
+    std::string version_suffix;
+    const Sha256Hash hash = shader_cache_key(&program, base_hash, is_vertex, hints, state.features, version_suffix);
+    {
+        std::lock_guard<std::mutex> guard(shaders_mutex);
+        const auto found = shaders.find(hash);
+        if (found != shaders.end() && found->second != nullptr)
+            return true;
+    }
+    return fs::exists(state.shaders_path / fmt::format("vk{}{}-{}.spv", shader::CURRENT_VERSION, version_suffix, hex_string(base_hash)));
+}
+
+void PipelineCache::warm_pair(const WarmRequest &request, MemState &mem) try {
+    const ProgramBinding &vertex_binding = *request.vertex;
+    const ProgramBinding &fragment_binding = *request.fragment;
+    const SceGxmProgram &vertex_gxp = *vertex_binding.program();
+    const SceGxmProgram &fragment_gxp = *fragment_binding.program();
+
+    std::vector<WarmState> states;
+    {
+        std::lock_guard<std::mutex> guard(warm_mutex);
+        // a draw already created a pipeline for it, so the driver cache holds that draw's state
+        if (pairs_drawn.contains(request.pair_key))
+            return;
+        states = warm_states;
+    }
+    if (states.empty()) {
+        // nothing drawn yet: an RGBA8 surface without casts
+        states.push_back(WarmState{
+            .color_format = static_cast<uint32_t>(SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR),
+            .render_pass = warm_render_pass,
+            .interlock_render_pass = warm_interlock_render_pass,
+        });
+    }
+
+    shader::Hints hints{
+        .attributes = &vertex_binding.attributes,
+        .color_format = SCE_GXM_COLOR_FORMAT_U8U8U8U8_ABGR,
+    };
+    std::fill_n(hints.vertex_textures, SCE_GXM_MAX_TEXTURE_UNITS, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
+    std::fill_n(hints.fragment_textures, SCE_GXM_MAX_TEXTURE_UNITS, SCE_GXM_TEXTURE_FORMAT_U8U8U8U8_ABGR);
+    hints.output_register_format = fragment_binding.fragment_program->output_register_format;
+
+    // a stage with no cached module is only generated here when the draw would generate the same module
+    if (!shader_available(vertex_gxp, vertex_binding.vertex_program->hash, true, hints) && !codegen_ignores_draw_hints(vertex_gxp, true, hints))
+        return;
+
+    const bool interlock = state.features.support_shader_interlock && fragment_gxp.is_frag_color_used();
+    for (const WarmState &warm_state : states) {
+        hints.color_format = static_cast<SceGxmColorFormat>(warm_state.color_format);
+        if (!shader_available(fragment_gxp, fragment_binding.fragment_program->hash, false, hints) && !codegen_ignores_draw_hints(fragment_gxp, false, hints))
+            continue;
+        const vk::RenderPass render_pass = interlock ? warm_state.interlock_render_pass : warm_state.render_pass;
+        if (!render_pass)
+            continue;
+        GxmRecordState record{};
+        record.color_base_format = gxm::get_base_format(hints.color_format);
+        const bool has_color_surface_data = warm_state.raw || record.color_base_format != SCE_GXM_COLOR_BASE_FORMAT_F16F16F16F16;
+
+        vk::Pipeline pipeline;
+        if (support_cache_only_creation)
+            pipeline = compile_pipeline(SCE_GXM_PRIMITIVE_TRIANGLES, render_pass, vertex_binding, fragment_binding, record, has_color_surface_data, hints, warm_state.casts, mem, true);
+        if (!pipeline)
+            pipeline = compile_pipeline(SCE_GXM_PRIMITIVE_TRIANGLES, render_pass, vertex_binding, fragment_binding, record, has_color_surface_data, hints, warm_state.casts, mem);
+        if (!pipeline)
+            continue;
+        // only the driver cache entry is wanted: the draw creates its own pipeline from it
+        state.device.destroyPipeline(pipeline);
+    }
+} catch (const std::exception &error) {
+    LOG_WARN("[PIPEWARM] background compile failed: {}", error.what());
+}
+
+void PipelineCache::note_draw_state(const WarmState &draw_state) {
+    auto &entry = draw_states[draw_state.key()];
+    if (entry.second == 0)
+        entry.first = draw_state;
+    entry.second++;
+    draw_states_total++;
+
+    // the most common state
+    std::vector<std::pair<uint32_t, const WarmState *>> ranked;
+    for (const auto &[state_key, value] : draw_states)
+        ranked.push_back({ value.second, &value.first });
+    std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+    std::vector<WarmState> top;
+    for (size_t i = 0; i < ranked.size() && top.size() < 2; i++) {
+        if (i > 0 && ranked[i].first * 4 < draw_states_total)
+            break;
+        top.push_back(*ranked[i].second);
+    }
+    std::lock_guard<std::mutex> guard(warm_mutex);
+    if (top.size() != warm_states.size() || !std::equal(top.begin(), top.end(), warm_states.begin(), [](const WarmState &a, const WarmState &b) { return a.key() == b.key(); }))
+        warm_states = top;
 }
 } // namespace renderer::vulkan

@@ -129,6 +129,21 @@ void log_memory_snapshot(const char *tag) {
         (oom_adj == LONG_MIN) ? std::string("?") : std::to_string(oom_adj));
 }
 
+bool read_available_memory(uint64_t &available_kib, uint64_t &total_kib) {
+    char buf[4096];
+    if (!read_small_file("/proc/meminfo", buf, sizeof(buf)))
+        return false;
+    available_kib = field_value(buf, "MemAvailable");
+    total_kib = field_value(buf, "MemTotal");
+    return available_kib != UINT64_MAX && total_kib != UINT64_MAX;
+}
+
+bool low_memory_device() {
+    uint64_t available_kib = 0;
+    uint64_t total_kib = 0;
+    return read_available_memory(available_kib, total_kib) && total_kib < 6ull * 1024 * 1024;
+}
+
 } // namespace mem_diag
 
 #else // !__linux__
@@ -136,6 +151,14 @@ void log_memory_snapshot(const char *tag) {
 namespace mem_diag {
 
 void log_memory_snapshot(const char *) {
+}
+
+bool read_available_memory(uint64_t &, uint64_t &) {
+    return false;
+}
+
+bool low_memory_device() {
+    return false;
 }
 
 } // namespace mem_diag

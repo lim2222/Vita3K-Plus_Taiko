@@ -17,7 +17,6 @@ data class OverlayConfig(
 
     @JvmField
     val overlayOpacity: Int = 100,
-
     @JvmField
     val hideOverlayWhenControllerConnected: Boolean = true,
 
@@ -32,7 +31,10 @@ data class OverlayConfig(
 
     // Seconds of inactivity before the overlay auto-hides. 0 = Never.
     @JvmField
-    val hideOverlayTimeSeconds: Int = 10
+    val hideOverlayTimeSeconds: Int = 10,
+
+    @JvmField
+    val touchSwitchTilt: Boolean = false
 ) {
     val controlsVisible: Boolean
         get() = overlayMask != 0

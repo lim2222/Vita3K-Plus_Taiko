@@ -32,17 +32,26 @@ struct SpirvUtilFunctions {
     spv::Function *fetch_memory{ nullptr };
     spv::Function *unpack_fx10{ nullptr };
     spv::Function *pack_fx10{ nullptr };
+    spv::Function *pack_f16_keep_denormals{ nullptr };
+    bool keep_f16_denormals = false; // set while a VPCK stores F16 on a GPU that flushes fp16 denormals
 
     // buffer_address_vec[i][1] contains the buffer pointer with an array of vec_i and stride 16 bytes
     // 0 in the last index is for the read buffer, 1 is for the write buffer
     // this is technically not a function but is the best place to put it
     // buffer_address_vec[0] is for a packed float[] array
     spv::Id buffer_address_vec[5][2] = {};
+
+    spv::Id vertex_stores = spv::NoResult;
+    int vertex_store_capacity = 0;
+    int vertex_store_count = 0;
+    int loop_depth = 0;
+    bool vertex_store_in_loop = false;
+    bool drop_buffer_stores = false;
 };
 
 spv::Id finalize(spv::Builder &b, spv::Id first, spv::Id second, const Swizzle4 swizz, spv::Id offset, const Imm4 dest_mask);
 spv::Id load(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand op, const Imm4 dest_mask, int shift_offset);
-void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, spv::Id source, std::uint8_t dest_mask, int off, bool raw_move = false, bool raw_move_keeps_declared = false);
+void store(spv::Builder &b, const SpirvShaderParameters &params, SpirvUtilFunctions &utils, const FeatureState &features, Operand dest, spv::Id source, std::uint8_t dest_mask, int off, bool raw_move = false, bool raw_move_keeps_declared = false, bool raw_f16_lanes = false);
 
 spv::Id unpack(spv::Builder &b, SpirvUtilFunctions &utils, const FeatureState &features, spv::Id target, const DataType type, Swizzle4 swizz, const Imm4 dest_mask,
     const int offset);

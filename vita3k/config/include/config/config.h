@@ -97,6 +97,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-button-psbutton", PhysicalKeyCode::KeyP, keyboard_button_psbutton)                                 \
     code(PhysicalKeyCode, "keyboard-gui-fullscreen", PhysicalKeyCode::F11, keyboard_gui_fullscreen)                                    \
     code(PhysicalKeyCode, "keyboard-gui-toggle-touch", PhysicalKeyCode::KeyT, keyboard_gui_toggle_touch)                               \
+    code(PhysicalKeyCode, "keyboard-gui-tilt", PhysicalKeyCode::Unbound, keyboard_gui_tilt)                                            \
     code(PhysicalKeyCode, "keyboard-toggle-texture-replacement", PhysicalKeyCode::Unbound, keyboard_toggle_texture_replacement)        \
     code(PhysicalKeyCode, "keyboard-take-screenshot", PhysicalKeyCode::Unbound, keyboard_take_screenshot)                              \
     code(PhysicalKeyCode, "keyboard-pinch-modifier", PhysicalKeyCode::Unbound, keyboard_pinch_modifier)                                \
@@ -129,6 +130,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(PhysicalKeyCode, "keyboard-button-psbutton-alt", PhysicalKeyCode::Unbound, keyboard_button_psbutton_alt)                      \
     code(PhysicalKeyCode, "keyboard-gui-fullscreen-alt", PhysicalKeyCode::Unbound, keyboard_gui_fullscreen_alt)                        \
     code(PhysicalKeyCode, "keyboard-gui-toggle-touch-alt", PhysicalKeyCode::Unbound, keyboard_gui_toggle_touch_alt)                    \
+    code(PhysicalKeyCode, "keyboard-gui-tilt-alt", PhysicalKeyCode::Unbound, keyboard_gui_tilt_alt)                                    \
     code(PhysicalKeyCode, "keyboard-toggle-texture-replacement-alt", PhysicalKeyCode::Unbound, keyboard_toggle_texture_replacement_alt)\
     code(PhysicalKeyCode, "keyboard-take-screenshot-alt", PhysicalKeyCode::Unbound, keyboard_take_screenshot_alt)                      \
     code(PhysicalKeyCode, "keyboard-pinch-modifier-alt", PhysicalKeyCode::Unbound, keyboard_pinch_modifier_alt)                        \
@@ -169,7 +171,6 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(bool, "texture-cache", true, texture_cache)                                                    \
     code(bool, "async-pipeline-compilation", false, async_pipeline_compilation)                          \
     code(bool, "accurate-thread-scheduling", true, accurate_thread_scheduling)                          \
-    code(bool, "preempt-on-wake", false, preempt_on_wake)                                               \
     code(int, "preempt-on-wake-us", 1000, preempt_on_wake_us)                                             \
     code(int, "guest-cores", 3, guest_cores)  /* the Vita gives an application three of its four cores */ \
     code(bool, "show-compile-shaders", true, show_compile_shaders)                                      \
@@ -179,6 +180,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(bool, "export-as-png", true, export_as_png)                                                    \
     code(std::string, "memory-mapping", VITA3K_DEFAULT_MEMORY_MAPPING, memory_mapping)                   \
     code(bool, "boot-apps-full-screen", false, boot_apps_full_screen)                                   \
+    code(bool, "enable-cheats", true, enable_cheats)                                                    \
     code(bool, "show-live-area-screen", false, show_live_area_screen)                                   \
     code(std::string, "audio-backend", "SDL", audio_backend)                                            \
     code(int, "audio-volume", 100, audio_volume)                                                        \
@@ -205,6 +207,7 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(bool, "disable-motion", false, disable_motion)                                                 \
     code(float, "controller-analog-multiplier", 1.0f, controller_analog_multiplier)                     \
     code(float, "portrait-y-offset", 0.0f, portrait_y_offset)                                              \
+    code(bool, "controller-swap-triggers", false, controller_swap_triggers)                             \
     CONFIG_KEYBOARD(code)                                                                               \
     code(std::string, "user-id", std::string{}, user_id)                                                \
     code(bool, "user-auto-connect", false, auto_user_login)                                             \

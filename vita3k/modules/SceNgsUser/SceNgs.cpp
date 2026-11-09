@@ -22,6 +22,7 @@
 #include <kernel/state.h>
 #include <kernel/thread/thread_state.h>
 #include <mutex>
+#include <ngs/modules/envelope.h>
 #include <ngs/state.h>
 #include <ngs/system.h>
 #include <unordered_map>
@@ -369,13 +370,8 @@ EXPORT(SceInt32, sceNgsRackRelease, ngs::Rack *rack, Ptr<void> callback) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
 
     std::unique_lock<std::recursive_mutex> lock(rack->system->voice_scheduler.mutex);
-    if (!rack->system->voice_scheduler.is_updating) {
-        const SceNgsCallbackInfo info = rack->release_callback_info(emuenv.mem);
+    if (!rack->system->voice_scheduler.is_updating && !callback) {
         ngs::release_rack(emuenv.ngs, emuenv.mem, rack->system, rack);
-        if (callback) {
-            lock.unlock();
-            ngs::invoke_callback(emuenv.kernel, emuenv.mem, thread_id, callback, info);
-        }
     } else if (!callback) {
         // wait for the update to finish
         // if this is called in an interrupt handler it will softlock ngs
@@ -480,6 +476,7 @@ EXPORT(SceUInt32, sceNgsSystemUpdate, ngs::System *system) {
         return 0;
     }
 
+    note_audio_thread(emuenv.kernel, thread_id, export_name);
     system->voice_scheduler.update(emuenv.kernel, emuenv.mem, thread_id);
 
     return SCE_NGS_OK;
@@ -900,6 +897,14 @@ EXPORT(SceInt32, sceNgsVoiceInit, ngs::Voice *voice, const SceNgsVoicePreset *pr
     return SCE_NGS_OK;
 }
 
+static bool voice_can_release(const MemState &mem, ngs::Voice &voice) {
+    for (size_t i = 0; i < voice.rack->modules.size(); i++) {
+        if (dynamic_cast<ngs::EnvelopeModule *>(voice.rack->modules[i].get()) && ngs::EnvelopeModule::can_release(mem, voice.datas[i]))
+            return true;
+    }
+    return false;
+}
+
 EXPORT(SceInt32, sceNgsVoiceKeyOff, ngs::Voice *voice) {
     TRACY_FUNC(sceNgsVoiceKeyOff, voice);
     if (!emuenv.cfg.current_config.ngs_enable) {
@@ -910,13 +915,25 @@ EXPORT(SceInt32, sceNgsVoiceKeyOff, ngs::Voice *voice) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
+    ngs::VoiceScheduler &scheduler = voice->rack->system->voice_scheduler;
+    const std::lock_guard<std::recursive_mutex> lock(scheduler.mutex);
+    if (voice->state != ngs::VoiceState::VOICE_STATE_ACTIVE)
+        return SCE_NGS_OK;
+    if (voice_can_release(emuenv.mem, *voice)) {
+        scheduler.off(emuenv.mem, voice);
+        return SCE_NGS_OK;
+    }
     voice->is_keyed_off = true;
-    voice->rack->system->voice_scheduler.off(emuenv.mem, voice);
+    scheduler.off(emuenv.mem, voice);
     voice->is_keyed_off = false;
-    voice->rack->system->voice_scheduler.stop(emuenv.mem, voice);
-
-    // call the finish callback, I got no idea what the module id should be in this case
-    voice->invoke_callback(emuenv.kernel, emuenv.mem, thread_id, voice->finished_callback, voice->finished_callback_user_data, 0);
+    if (scheduler.stop(emuenv.mem, voice)) {
+        ngs::OperationPending op;
+        op.type = ngs::PendingType::VoiceFinished;
+        op.system = voice->rack->system;
+        op.finished_data.voice = voice;
+        op.finished_data.play_count = voice->play_count;
+        scheduler.operations_pending.push(op);
+    }
     return SCE_NGS_OK;
 }
 
@@ -930,6 +947,7 @@ EXPORT(int, sceNgsVoiceKill, ngs::Voice *voice) {
         return RET_ERROR(SCE_NGS_ERROR_INVALID_ARG);
     }
 
+    voice->rack->system->voice_scheduler.cancel_finished_callback(voice);
     voice->rack->system->voice_scheduler.stop(emuenv.mem, voice);
 
     return 0;

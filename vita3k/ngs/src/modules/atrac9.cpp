@@ -35,6 +35,18 @@ static int32_t valid_buffer_index(const int32_t index) {
     return (index >= 0 && index < SCE_NGS_AT9_MAX_BUFFER_PARAMS) ? index : -1;
 }
 
+static int32_t first_buffer_with_data(const SceNgsAT9Params *params, int32_t index, const bool null_ends) {
+    for (int32_t visited = 0; visited <= SCE_NGS_AT9_MAX_BUFFER_PARAMS && index != -1; visited++) {
+        const SceNgsAT9BufferParams &buffer = params->buffer_params[index];
+        if (buffer.buffer && buffer.bytes_count > 0)
+            return index;
+        if (null_ends && !buffer.buffer)
+            return -1;
+        index = valid_buffer_index(buffer.next_buffer_index);
+    }
+    return -1;
+}
+
 std::unique_ptr<ModuleLogicalState> Atrac9Module::create_logical_state() const {
     return std::make_unique<Atrac9LogicalState>();
 }
@@ -56,8 +68,9 @@ void Atrac9Module::on_state_change(const MemState &mem, ModuleData &data, const 
         logical->decoded_pcm.clear();
         logical->rate_resampler.reset();
         logical->superframe_staging.clear();
-        logical->starved_ticks = 0;
-        logical->in_underrun_wait = false;
+        logical->lead_in_pending = true;
+        logical->samples_played = 0;
+        logical->reached_data = false;
         {
             static std::atomic<uint64_t> keyons{ 0 };
             const uint64_t n = keyons.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -69,16 +82,6 @@ void Atrac9Module::on_state_change(const MemState &mem, ModuleData &data, const 
         state->current_byte_position_in_buffer = 0;
         logical->current_loop_count = 0;
         state->current_buffer = 0;
-        logical->rate_resampler.reset();
-    }
-}
-
-void Atrac9Module::on_param_change(const MemState &mem, ModuleData &data) {
-    Atrac9LogicalState *logical = data.get_logical_state<Atrac9LogicalState>();
-    const SceNgsAT9Params *old_params = reinterpret_cast<SceNgsAT9Params *>(data.last_info.data());
-    const SceNgsAT9Params *new_params = static_cast<SceNgsAT9Params *>(data.info.data.get(mem));
-
-    if (old_params->playback_frequency != new_params->playback_frequency || old_params->playback_scalar != new_params->playback_scalar) {
         logical->rate_resampler.reset();
     }
 }
@@ -120,15 +123,6 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
                 // we are done
                 scheduler_lock.lock();
                 voice_lock.lock();
-                return false;
-            } else if (!params->buffer_params[state->current_buffer].buffer
-                || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
-                // Chain continues but the next buffer is empty: prod the streamer and wait.
-                data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_SWAPPED_BUFFER, prev_index,
-                    params->buffer_params[state->current_buffer].buffer.address());
-                scheduler_lock.lock();
-                voice_lock.lock();
-                logical->in_underrun_wait = true;
                 return false;
             } else {
                 data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_SWAPPED_BUFFER, prev_index,
@@ -339,7 +333,7 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
     }
 
     const int32_t sample_rate = data.parent->rack->system->sample_rate;
-    if (params->playback_scalar != 1 || static_cast<int>(std::round(params->playback_frequency)) != sample_rate) {
+    if (logical->rate_resampler.continuous || params->playback_scalar != 1 || static_cast<int>(std::round(params->playback_frequency)) != sample_rate) {
         LOG_INFO_ONCE("The currently running game requests playback rate scaling when decoding audio. Audio might crackle.");
         double src_sample_rate = params->playback_frequency;
         if (params->playback_scalar != 1.0f) {
@@ -381,8 +375,6 @@ bool Atrac9Module::decode_more_data(KernelState &kern, const MemState &mem, cons
 
     logical->superframe_staging.clear();
 
-    state->samples_generated_since_key_on += decoded_size * params->channels;
-    state->samples_generated_total += decoded_size * params->channels;
     state->bytes_consumed_since_key_on += superframe_size;
     state->total_bytes_consumed += superframe_size;
     runtime->decoder->export_state(&logical->saved_state);
@@ -397,70 +389,88 @@ bool Atrac9Module::process(KernelState &kern, const MemState &mem, const SceUID 
     Atrac9RuntimeState *runtime = data.get_runtime_state<Atrac9RuntimeState>();
     assert(state);
 
+    const uint32_t granularity = static_cast<uint32_t>(data.parent->rack->system->granularity);
+    if (logical->lead_in_pending) {
+        logical->lead_in_pending = false;
+        logical->lead_in_samples_left = static_cast<uint32_t>(std::max<int32_t>(params->lead_in_samples, 0));
+        if (params->lead_in_samples > 0 || params->limit_number_of_samples_played > 0)
+            LOG_INFO_ONCE("NGS ATRAC9 player: the game uses a lead-in ({} samples) or a sample limit ({} samples)", params->lead_in_samples, params->limit_number_of_samples_played);
+    }
+    if (logical->lead_in_samples_left >= granularity) {
+        logical->lead_in_samples_left -= granularity;
+        data.ensure_scratch_size(static_cast<size_t>(granularity) * sizeof(float) * 2);
+        std::fill(data.scratch_data.begin(), data.scratch_data.end(), 0);
+        data.parent->products[0].data = data.scratch_data.data();
+        return false;
+    }
+
     state->current_buffer = valid_buffer_index(state->current_buffer);
     if (state->current_buffer == -1) {
         return true;
     }
-    if (!params->buffer_params[state->current_buffer].buffer
-        || params->buffer_params[state->current_buffer].bytes_count == 0) {
-        // Keyed on before the first buffer, or a mid-stream underrun: stay alive, do not finish.
-        constexpr int8_t max_starved_ticks = 16; // ~170ms at the default granularity
-        if (logical->starved_ticks < max_starved_ticks) {
-            logical->starved_ticks++;
-            LOG_WARN_ONCE("NGS AT9: waiting for the game to publish buffer data (was previously an instant voice kill)");
-            return false;
-        }
-        // never recovered: deliver the end the stream never reached, then finish
-        voice_lock.unlock();
-        scheduler_lock.unlock();
-        data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_END_OF_DATA, 0, 0);
-        scheduler_lock.lock();
-        voice_lock.lock();
-        return true;
-    }
-    logical->starved_ticks = 0;
 
     logical->decoded_pcm.compact();
 
+    const uint32_t lead_in = logical->lead_in_samples_left;
+    logical->lead_in_samples_left = 0;
+    const int32_t limit = params->limit_number_of_samples_played;
+    uint32_t wanted = granularity - lead_in;
+    if (limit > 0)
+        wanted = static_cast<uint32_t>(std::min<uint64_t>(wanted, static_cast<uint64_t>(limit) - std::min<uint64_t>(logical->samples_played, limit)));
+
     bool is_finished = false;
     // call decode more data until we either have an error or reached end of data
-    while (static_cast<int32_t>(logical->decoded_pcm.available_frames()) < data.parent->rack->system->granularity) {
+    while (logical->decoded_pcm.available_frames() < wanted) {
+        const int32_t playable = first_buffer_with_data(params, state->current_buffer, null_buffer_ends_stream && logical->reached_data);
+        if (playable == -1) {
+            if (!logical->reached_data)
+                break;
+            voice_lock.unlock();
+            scheduler_lock.unlock();
+            data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_END_OF_DATA, 0, 0);
+            scheduler_lock.lock();
+            voice_lock.lock();
+            is_finished = true;
+            break;
+        }
+        logical->reached_data = true;
+        if (playable != state->current_buffer) {
+            state->current_buffer = playable;
+            state->current_byte_position_in_buffer = 0;
+            logical->current_loop_count = 0;
+        }
         if (!decode_more_data(kern, mem, thread_id, data, params, state, logical, runtime, scheduler_lock, voice_lock)) {
-            is_finished = !logical->in_underrun_wait;
-            logical->in_underrun_wait = false;
+            is_finished = true;
             break;
         }
     }
 
-    const uint32_t granularity = static_cast<uint32_t>(data.parent->rack->system->granularity);
     const uint32_t available_samples = logical->decoded_pcm.available_frames();
-    const uint32_t samples_to_be_passed = std::min<uint32_t>(available_samples, granularity);
+    const uint32_t samples_to_be_passed = std::min<uint32_t>(available_samples, wanted);
 
-    if (available_samples >= granularity) {
+    if (lead_in == 0 && samples_to_be_passed == granularity) {
         data.parent->products[0].data = logical->decoded_pcm.read_bytes();
     } else {
         data.ensure_scratch_size(static_cast<size_t>(granularity) * sizeof(float) * 2);
         std::fill(data.scratch_data.begin(), data.scratch_data.end(), 0);
-        if (available_samples > 0) {
-            std::memcpy(data.scratch_data.data(), logical->decoded_pcm.read_bytes(), static_cast<size_t>(available_samples) * sizeof(float) * 2);
+        if (samples_to_be_passed > 0) {
+            std::memcpy(data.scratch_data.data() + static_cast<size_t>(lead_in) * sizeof(float) * 2, logical->decoded_pcm.read_bytes(), static_cast<size_t>(samples_to_be_passed) * sizeof(float) * 2);
         }
         data.parent->products[0].data = data.scratch_data.data();
     }
 
     logical->decoded_pcm.consume_frames(samples_to_be_passed);
+    logical->samples_played += samples_to_be_passed;
+    state->samples_generated_since_key_on += samples_to_be_passed * SCE_NGS_MAX_SYSTEM_CHANNELS;
+    state->samples_generated_total += samples_to_be_passed * SCE_NGS_MAX_SYSTEM_CHANNELS;
 
-    // Assume a live unpaused stream decoding just silence for ~15s is an abandoned stream
-    constexpr bool NGS_FINISH_DEAD_STREAMS = true;
-    constexpr uint32_t DEAD_STREAM_SILENT_SUPERFRAMES = 700;
-    if (NGS_FINISH_DEAD_STREAMS && !is_finished && logical->diag_silent_streak >= DEAD_STREAM_SILENT_SUPERFRAMES) {
-        LOG_INFO("[NGSLIFE] DEAD-STREAM FINISH voice={} after {} silent superframes (~{}s) - delivering END_OF_DATA so the game reclaims its stream entry",
-            fmt::ptr(data.parent), logical->diag_silent_streak, logical->diag_silent_streak * 21 / 1000);
+    if (!is_finished && limit > 0 && logical->samples_played >= static_cast<uint64_t>(limit)) {
         voice_lock.unlock();
         scheduler_lock.unlock();
         data.invoke_callback(kern, mem, thread_id, SCE_NGS_AT9_END_OF_DATA, 0, 0);
         scheduler_lock.lock();
         voice_lock.lock();
-        return true;
+        is_finished = true;
     }
 
     return is_finished;

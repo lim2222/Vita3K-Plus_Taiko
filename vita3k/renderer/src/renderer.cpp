@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <future>
 #include <mutex>
 #include <vector>
@@ -262,12 +263,13 @@ void set_side_fragment_program_enable(State &state, Context *ctx, const bool is_
     renderer::add_state_set_command(ctx, renderer::GXMState::FragmentProgramEnable, is_front, mode);
 }
 
-void set_context(State &state, Context *ctx, RenderTarget *target, SceGxmColorSurface *color_surface, SceGxmDepthStencilSurface *depth_stencil_surface) {
-    renderer::add_command(ctx, renderer::CommandOpcode::SetContext, nullptr, target, color_surface, depth_stencil_surface);
+void set_context(State &state, Context *ctx, RenderTarget *target, SceGxmColorSurface *color_surface, SceGxmDepthStencilSurface *depth_stencil_surface, SceGxmDepthStencilSurface *store_depth_stencil_surface) {
+    renderer::add_command(ctx, renderer::CommandOpcode::SetContext, nullptr, target, color_surface, depth_stencil_surface, store_depth_stencil_surface);
 }
 
 namespace {
 constexpr bool GUEST_STREAM_SNAPSHOT = true;
+constexpr bool GUEST_INDEX_SNAPSHOT = true;
 constexpr size_t SNAP_RING_SIZE = 64u * 1024u * 1024u;
 // only a small stream is copied (every stream a game has been seen to recycle is a small per-draw block)
 // a game that indexes deep into a large shared buffer which would overlap the ring every frame
@@ -320,7 +322,7 @@ uint64_t snap_copy_locked(MemState &mem, const uint32_t addr, const uint32_t siz
 } // namespace
 
 void stream_snapshot_kick(MemState &mem, CommandList &list) {
-    if (!GUEST_STREAM_SNAPSHOT || g_snap_disabled.load(std::memory_order_relaxed) || !list.first)
+    if ((!GUEST_STREAM_SNAPSHOT && !GUEST_INDEX_SNAPSHOT) || g_snap_disabled.load(std::memory_order_relaxed) || !list.first)
         return;
 
     Command *from = list.first;
@@ -333,7 +335,21 @@ void stream_snapshot_kick(MemState &mem, CommandList &list) {
     if (g_snap_disabled.load(std::memory_order_relaxed))
         return;
     for (Command *cmd = from; cmd; cmd = cmd == list.last ? nullptr : cmd->next) {
-        if (cmd->opcode != CommandOpcode::SetState)
+        if (cmd->opcode == CommandOpcode::Draw) {
+            if (!GUEST_INDEX_SNAPSHOT)
+                continue;
+            CommandHelper helper(cmd);
+            helper.pop<SceGxmPrimitiveType>();
+            const SceGxmIndexFormat format = helper.pop<SceGxmIndexFormat>();
+            const Ptr<const void> indices = helper.pop<Ptr<const void>>();
+            const uint32_t count = helper.pop<uint32_t>();
+            helper.pop<uint32_t>();
+            const uint64_t length = static_cast<uint64_t>(count) * (format == SCE_GXM_INDEX_FORMAT_U16 ? 2 : 4);
+            uint64_t handle = length <= SNAP_MAX_BYTES ? snap_copy_locked(mem, indices.address(), static_cast<uint32_t>(length)) : ~0ull;
+            helper.push(handle);
+            continue;
+        }
+        if (!GUEST_STREAM_SNAPSHOT || cmd->opcode != CommandOpcode::SetState)
             continue;
         CommandHelper helper(cmd);
         if (helper.pop<GXMState>() != GXMState::VertexStream)
@@ -346,14 +362,24 @@ void stream_snapshot_kick(MemState &mem, CommandList &list) {
     }
 }
 
+int64_t coarse_now_ms() {
+#ifdef __linux__
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+#else
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+
 const uint8_t *stream_snapshot_get(const uint64_t handle, const uint32_t size) {
-    if (!GUEST_STREAM_SNAPSHOT || handle == ~0ull || !size)
+    if ((!GUEST_STREAM_SNAPSHOT && !GUEST_INDEX_SNAPSHOT) || handle == ~0ull || !size)
         return nullptr;
 
     const std::lock_guard<std::mutex> lock(g_snap_mutex);
-    const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (now >= g_snap_next_report) {
-        g_snap_next_report = now + 10000000;
+    const int64_t now_ms = coarse_now_ms();
+    if (now_ms >= g_snap_next_report) {
+        g_snap_next_report = now_ms + 10000;
         LOG_INFO("[SNAPSHOT] copied {} bound {} stale {} mismatch {}", g_snap_copied, g_snap_bound, g_snap_stale, g_snap_mismatch);
     }
 
@@ -395,12 +421,16 @@ void stream_snapshot_disable_for_program(const uint32_t program_addr, const uint
     LOG_INFO("[SNAPSHOT] disabled for this game: the program at 0x{:08X} (flags 0x{:X}) writes memory from the GPU, so a copy of a vertex stream taken on the guest thread could miss what the GPU writes into it later", program_addr, program_flags);
 }
 
+bool stream_snapshot_disabled() {
+    return g_snap_disabled.load(std::memory_order_relaxed);
+}
+
 void set_vertex_stream(State &state, Context *ctx, const std::size_t index, const std::size_t data_len, const Ptr<const void> stream) {
     renderer::add_state_set_command(ctx, renderer::GXMState::VertexStream, stream, index, data_len, static_cast<uint64_t>(~0ull));
 }
 
 void draw(State &state, Context *ctx, SceGxmPrimitiveType prim_type, SceGxmIndexFormat index_type, Ptr<const void> index_data, const std::uint32_t index_count, const std::uint32_t instance_count) {
-    renderer::add_command(ctx, renderer::CommandOpcode::Draw, nullptr, prim_type, index_type, index_data, index_count, instance_count);
+    renderer::add_command(ctx, renderer::CommandOpcode::Draw, nullptr, prim_type, index_type, index_data, index_count, instance_count, static_cast<uint64_t>(~0ull));
 }
 
 void transfer_copy(State &state, uint32_t colorKeyValue, uint32_t colorKeyMask, SceGxmTransferColorKeyMode colorKeyMode, const SceGxmTransferImage *images, SceGxmTransferType srcType, SceGxmTransferType destType) {
@@ -438,8 +468,9 @@ void destroy_context_during_shutdown(State &state, std::unique_ptr<Context> &con
         state.set_current();
     }
 
+    std::erase(state.live_contexts, context.get());
     if (state.context == context.get()) {
-        state.context = nullptr;
+        state.context = state.live_contexts.empty() ? nullptr : state.live_contexts.back();
     }
 
     context.reset();

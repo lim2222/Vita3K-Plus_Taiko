@@ -23,15 +23,18 @@
 #include <renderer/vulkan/state.h>
 
 #include <gxm/types.h>
+#include <shader/spirv_recompiler.h>
 
 #include <vkutil/vkutil.h>
+
+#include <future>
 
 namespace renderer::vulkan {
 
 VKContext::VKContext(VKState &state, MemState &mem)
     : state(state)
     , mem(mem)
-    , vertex_stream_ring_buffer(vk::BufferUsageFlagBits::eVertexBuffer, MiB(/*128*/ 64))
+    , vertex_stream_ring_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer, MiB(/*128*/ 64))
     , index_stream_ring_buffer(vk::BufferUsageFlagBits::eIndexBuffer, MiB(64))
     , vertex_uniform_stream_ring_buffer(vk::BufferUsageFlagBits::eStorageBuffer, MiB(/*256*/ 64))
     , fragment_uniform_stream_ring_buffer(vk::BufferUsageFlagBits::eStorageBuffer, MiB(/*256*/ 64))
@@ -58,7 +61,7 @@ VKContext::VKContext(VKState &state, MemState &mem)
         std::fill_n(vertex_stream_buffers, SCE_GXM_MAX_VERTEX_STREAMS, state.default_buffer.buffer);
 
         // also initialize the gpu wait thread
-        gpu_request_wait_thread = std::thread(&VKContext::wait_thread_function, this, std::ref(mem));
+        state.start_gpu_request_wait_thread(mem);
     } else {
         // these are not needed when using memory mapping
         vertex_stream_ring_buffer.create();
@@ -150,8 +153,15 @@ VKContext::VKContext(VKState &state, MemState &mem)
 }
 
 VKContext::~VKContext() {
-    if (gpu_request_wait_thread.joinable())
-        gpu_request_wait_thread.join();
+    if (state.features.enable_memory_mapping && state.gpu_request_wait_thread.joinable() && !state.request_queue.is_aborted()) {
+        auto promise = std::make_shared<std::promise<void>>();
+        std::future<void> future = promise->get_future();
+        state.request_queue.push(CallbackRequest{ new CallbackRequestFunction([promise]() { promise->set_value(); }) });
+        while (future.wait_for(std::chrono::milliseconds(5)) != std::future_status::ready) {
+            if (state.request_queue.is_aborted())
+                break;
+        }
+    }
 
     for (auto &[addr, vb] : visibility_buffers)
         state.device.destroy(vb.query_pool);
@@ -182,7 +192,10 @@ VKRenderTarget::VKRenderTarget(VKState &state, const SceGxmRenderTargetParams &p
         depthstencil.height *= 2;
     }
 
-    depthstencil.init_image(vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransientAttachment);
+    if (state.features.support_depth_mirror)
+        depthstencil.init_image(vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransferSrc);
+    else
+        depthstencil.init_image(vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransientAttachment);
 
     // transition images to their right state
     vk::CommandBuffer cmd_buffer = vkutil::create_single_time_command(state.device, state.general_command_pool);
@@ -313,6 +326,7 @@ bool create(std::unique_ptr<FragmentProgram> &fp, VKState &state, const SceGxmPr
 
     // compute blending hash, as it will be used for the pipeline hash
     fp_vk->blending_hash = XXH_INLINE_XXH3_64bits(&fp_vk->blending, sizeof(vk::PipelineColorBlendAttachmentState));
+    fp_vk->depth_mirror = shader::uses_depth_mirror(program, state.features);
     return true;
 }
 

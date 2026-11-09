@@ -23,6 +23,7 @@
 #include <io/functions.h>
 #include <io/io.h>
 #include <io/vfs.h>
+#include <kernel/thread/thread_state.h>
 
 #include <packages/license.h>
 #include <packages/sfo.h>
@@ -254,6 +255,7 @@ std::string construct_slotparam_path(const unsigned int data) {
 
 EXPORT(int, sceAppUtilSaveDataDataRemove, SceAppUtilSaveDataFileSlot *slot, SceAppUtilSaveDataRemoveItem *files, unsigned int fileNum, SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataDataRemove, slot, files, fileNum, mountPoint);
+    start_preempt_file_call(export_name);
     if (!files && fileNum)
         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
 
@@ -279,6 +281,7 @@ EXPORT(int, sceAppUtilSaveDataDataRemove, SceAppUtilSaveDataFileSlot *slot, SceA
 
 EXPORT(int, sceAppUtilSaveDataDataSave, SceAppUtilSaveDataFileSlot *slot, SceAppUtilSaveDataDataSaveItem *files, unsigned int fileNum, SceAppUtilMountPoint *mountPoint, SceSize *requiredSizeKiB) {
     TRACY_FUNC(sceAppUtilSaveDataDataSave, slot, files, fileNum, mountPoint, requiredSizeKiB);
+    start_preempt_file_call(export_name);
     SceUID fd;
 
     if (requiredSizeKiB)
@@ -358,6 +361,7 @@ EXPORT(int, sceAppUtilSaveDataDataSave, SceAppUtilSaveDataFileSlot *slot, SceApp
 
 EXPORT(int, sceAppUtilSaveDataGetQuota, SceSize *quotaSizeKiB, SceSize *usedSizeKiB, const SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataGetQuota, quotaSizeKiB, usedSizeKiB, mountPoint);
+    start_preempt_file_call(export_name);
 
     if (!quotaSizeKiB && !usedSizeKiB)
         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
@@ -384,13 +388,52 @@ EXPORT(int, sceAppUtilSaveDataGetQuota, SceSize *quotaSizeKiB, SceSize *usedSize
     return 0;
 }
 
-EXPORT(int, sceAppUtilSaveDataMount) {
-    TRACY_FUNC(sceAppUtilSaveDataMount);
-    return UNIMPLEMENTED();
+struct SceAppUtilTitleId {
+    SceChar8 data[10];
+    SceChar8 padding[6];
+};
+
+struct SceAppUtilPassCode {
+    SceUChar8 data[32];
+};
+
+EXPORT(SceInt32, sceAppUtilSaveDataMount, const SceAppUtilTitleId *titleId, const SceAppUtilPassCode *passCode) {
+    TRACY_FUNC(sceAppUtilSaveDataMount, titleId, passCode);
+    start_preempt_file_call(export_name);
+    if (!titleId || !passCode)
+        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+
+    const char *const id = reinterpret_cast<const char *>(titleId->data);
+    const std::string title_id(id, strnlen(id, sizeof(titleId->data)));
+    // the title must be listed in INSTALL_DIR_SAVEDATA_ADD_1..7 of the app's param.sfo
+    bool listed = false;
+    for (int i = 1; i <= 7 && !listed; i++) {
+        std::string listed_id;
+        if (sfo::get_data_by_key(listed_id, emuenv.sfo_handle, fmt::format("INSTALL_DIR_SAVEDATA_ADD_{}", i))
+            || sfo::get_data_by_key(listed_id, emuenv.sfo_handle, fmt::format("INSTALL_DIR_SAVEDATA_ADD{}", i)))
+            listed = listed_id.c_str() == title_id;
+    }
+    if (!listed) {
+        LOG_WARN("sceAppUtilSaveDataMount: {} is not in INSTALL_DIR_SAVEDATA_ADD of param.sfo", title_id);
+        return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
+    }
+    if (!emuenv.io.device_paths.savedata1.empty())
+        return RET_ERROR(SCE_APPUTIL_ERROR_BUSY);
+
+    // the passcode of the other title's package is not known here, so it is not checked
+    const std::string savedata_path = "user/" + emuenv.io.user_id + "/savedata/" + title_id;
+    if (!fs::is_directory(emuenv.vita_fs_path / "ux0" / savedata_path)) {
+        LOG_INFO("sceAppUtilSaveDataMount: no save data of {} at ux0:{}", title_id, savedata_path);
+        return SCE_ERROR_ERRNO_ENOENT;
+    }
+    emuenv.io.device_paths.savedata1 = savedata_path;
+    LOG_INFO("sceAppUtilSaveDataMount: savedata1: is ux0:{}", savedata_path);
+    return 0;
 }
 
 EXPORT(int, sceAppUtilSaveDataSlotCreate, unsigned int slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataSlotCreate, slotId, param, mountPoint);
+    start_preempt_file_call(export_name);
     const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_WRONLY | SCE_O_CREAT, emuenv.vita_fs_path, export_name);
     write_file(fd, param, sizeof(SceAppUtilSaveDataSlotParam), emuenv.io, export_name);
     close_file(emuenv.io, fd, export_name);
@@ -399,12 +442,14 @@ EXPORT(int, sceAppUtilSaveDataSlotCreate, unsigned int slotId, SceAppUtilSaveDat
 
 EXPORT(int, sceAppUtilSaveDataSlotDelete, unsigned int slotId, SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataSlotDelete, slotId, mountPoint);
+    start_preempt_file_call(export_name);
     remove_file(emuenv.io, construct_slotparam_path(slotId).c_str(), emuenv.vita_fs_path, export_name);
     return 0;
 }
 
 EXPORT(int, sceAppUtilSaveDataSlotGetParam, unsigned int slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataSlotGetParam, slotId, param, mountPoint);
+    start_preempt_file_call(export_name);
     const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_RDONLY, emuenv.vita_fs_path, export_name);
     if (fd < 0)
         return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND);
@@ -417,6 +462,7 @@ EXPORT(int, sceAppUtilSaveDataSlotGetParam, unsigned int slotId, SceAppUtilSaveD
 EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, const SceAppUtilSaveDataSlotSearchCond *cond,
     SceAppUtilSlotSearchResult *result, const SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataSlotSearch, workBuf, cond, result, mountPoint);
+    start_preempt_file_call(export_name);
     STUBBED("No sort slot list");
 
     if (!cond || !result)
@@ -469,6 +515,7 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSearch, SceAppUtilWorkBuffer *workBuf, co
 
 EXPORT(SceInt32, sceAppUtilSaveDataSlotSetParam, SceAppUtilSaveDataSlotId slotId, SceAppUtilSaveDataSlotParam *param, SceAppUtilMountPoint *mountPoint) {
     TRACY_FUNC(sceAppUtilSaveDataSlotSetParam, slotId, param, mountPoint);
+    start_preempt_file_call(export_name);
     const auto fd = open_file(emuenv.io, construct_slotparam_path(slotId).c_str(), SCE_O_WRONLY, emuenv.vita_fs_path, export_name);
     if (fd < 0)
         return RET_ERROR(SCE_APPUTIL_ERROR_SAVEDATA_SLOT_NOT_FOUND);
@@ -477,9 +524,12 @@ EXPORT(SceInt32, sceAppUtilSaveDataSlotSetParam, SceAppUtilSaveDataSlotId slotId
     return 0;
 }
 
-EXPORT(int, sceAppUtilSaveDataUmount) {
+EXPORT(SceInt32, sceAppUtilSaveDataUmount) {
     TRACY_FUNC(sceAppUtilSaveDataUmount);
-    return UNIMPLEMENTED();
+    if (emuenv.io.device_paths.savedata1.empty())
+        return RET_ERROR(SCE_APPUTIL_ERROR_NOT_MOUNTED);
+    emuenv.io.device_paths.savedata1.clear();
+    return 0;
 }
 
 static SceInt32 SafeMemory(EmuEnvState &emuenv, void *buf, SceSize bufSize, SceOff offset, const char *export_name, bool save) {
@@ -509,6 +559,7 @@ static SceInt32 SafeMemory(EmuEnvState &emuenv, void *buf, SceSize bufSize, SceO
 
 EXPORT(SceInt32, sceAppUtilLoadSafeMemory, void *buf, SceSize bufSize, SceOff offset) {
     TRACY_FUNC(sceAppUtilLoadSafeMemory, buf, bufSize, offset);
+    start_preempt_file_call(export_name);
     if (!buf || (offset + bufSize > SCE_APPUTIL_SAFEMEMORY_MEMORY_SIZE))
         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
 
@@ -520,6 +571,7 @@ EXPORT(SceInt32, sceAppUtilLoadSafeMemory, void *buf, SceSize bufSize, SceOff of
 
 EXPORT(SceInt32, sceAppUtilSaveSafeMemory, const void *buf, SceSize bufSize, SceOff offset) {
     TRACY_FUNC(sceAppUtilSaveSafeMemory, buf, bufSize, offset);
+    start_preempt_file_call(export_name);
     if (!buf || (offset + bufSize > SCE_APPUTIL_SAFEMEMORY_MEMORY_SIZE))
         return RET_ERROR(SCE_APPUTIL_ERROR_PARAMETER);
 

@@ -33,7 +33,9 @@
 #endif
 #include <display/functions.h>
 
+#include <cheat/functions.h>
 #include <config/state.h>
+#include <ctrl/functions.h>
 #include <dialog/state.h>
 #include <display/state.h>
 #include <emuenv/state.h>
@@ -49,11 +51,11 @@
 #include <chrono>
 #include <motion/functions.h>
 #include <touch/functions.h>
+#include <touch/state.h>
 
 // Code heavily influenced by PPSSSPP's SceDisplay.cpp
 
-static constexpr int TARGET_FPS = 60;
-static constexpr int64_t TARGET_MICRO_PER_FRAME = 1000000LL / TARGET_FPS;
+static constexpr int64_t VBLANK_PERIOD_NS = 16'683'333;
 // how many cycles do we need to see before we start predicting the next frame
 static constexpr int predict_threshold = 3;
 static constexpr int max_expected_swapchain_size = 6;
@@ -122,6 +124,25 @@ static void freeze_watchdog_thread(EmuEnvState &emuenv) {
     }
 }
 
+static void wake_half_vblank_waiters(DisplayState &display) {
+    std::vector<ThreadStatePtr> ready;
+    {
+        const std::lock_guard<std::mutex> guard(display.mutex);
+        for (std::size_t i = 0; i < display.vblank_wait_infos.size();) {
+            if (display.vblank_wait_infos[i].wake_at_half_vblank) {
+                ready.push_back(display.vblank_wait_infos[i].target_thread);
+                display.vblank_wait_infos.erase(display.vblank_wait_infos.begin() + i);
+            } else {
+                i++;
+            }
+        }
+    }
+    for (const ThreadStatePtr &target_wait : ready) {
+        const std::lock_guard<std::mutex> target_lock(target_wait->mutex);
+        target_wait->update_status(ThreadStatus::run);
+    }
+}
+
 static void vblank_sync_thread(EmuEnvState &emuenv) {
     DisplayState &display = emuenv.display;
     std::thread watchdog(freeze_watchdog_thread, std::ref(emuenv));
@@ -129,9 +150,13 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
     // Keeps ticking at 60 Hz while the guest vblank counter is frozen during a
     // pause, so the paused UI/common-dialog screen refresh still runs at 30 fps.
     uint64_t ui_refresh_counter = 0;
+    const cheat::JitInvalidate invalidate_jit = [&emuenv](uint32_t address, size_t size) {
+        emuenv.kernel.invalidate_jit_cache(address, size);
+    };
 
     while (!display.abort.load()) {
         std::vector<ThreadStatePtr> vblank_ready;
+        bool has_frame = false;
         {
             const std::lock_guard<std::mutex> guard(display.mutex);
             const bool guest_paused = emuenv.kernel.is_threads_paused();
@@ -144,6 +169,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 // pause duration while the paused audio stream has not moved.
                 if (!guest_paused)
                     ++display.vblank_count;
+
+                has_frame = static_cast<bool>(display.sce_frame.base);
 
                 // in this case, even though no new game frames are being rendered, we still need to update the screen
                 if (guest_paused || (emuenv.common_dialog.status == SCE_COMMON_DIALOG_STATUS_RUNNING))
@@ -158,6 +185,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
 
             // maybe we should also use a mutex for this part, but it shouldn't be an issue
             touch_vsync_update(emuenv);
+            set_touch_tilt(emuenv.motion, emuenv.ctrl, emuenv.touch.tilt_active, emuenv.touch.tilt_x, emuenv.touch.tilt_y);
             refresh_motion(emuenv.motion, emuenv.ctrl);
 
             // Notify Vblank callback in each VBLANK start
@@ -178,6 +206,15 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             const std::lock_guard<std::mutex> target_lock(target_wait->mutex);
             target_wait->update_status(ThreadStatus::run);
         }
+
+        if (has_frame)
+            emuenv.cheat.count_frame();
+
+        // Cheat codes are re-applied on every vblank, the same way the Vita cheat plugins do (outside display.mutex since one can run 65536 writes).
+        // The pad is read here rather than taken from the game, which may stop reading it while a button is held.
+        if (cheat::enabled_cheat_count(emuenv.cheat) != 0)
+            cheat::set_buttons(emuenv.cheat, ctrl_peek_buttons(emuenv, 1));
+        cheat::apply(emuenv.cheat, emuenv.mem, invalidate_jit);
         // Periodic thread dump for diagnosing partial hangs
         if (emuenv.cfg.hang_dump_seconds > 0) {
             static uint64_t next_forced_dump_vblank = 0;
@@ -186,6 +223,14 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             if (period > 0 && vblanks_now >= next_forced_dump_vblank && !emuenv.kernel.is_threads_paused()) {
                 next_forced_dump_vblank = vblanks_now + period;
                 LOG_ERROR("PERIODIC THREAD DUMP (hang-dump-seconds={}) — vblank {}", emuenv.cfg.hang_dump_seconds, vblanks_now);
+                emuenv.kernel.log_thread_hang_dump();
+            }
+        }
+
+        {
+            std::string deferred_reason;
+            if (!emuenv.kernel.is_threads_paused() && take_deferred_thread_dump(deferred_reason)) {
+                LOG_ERROR("DEFERRED THREAD DUMP: {}", deferred_reason);
                 emuenv.kernel.log_thread_hang_dump();
             }
         }
@@ -218,6 +263,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             static uint64_t last_seen_vblanks = 0;
             static uint64_t last_idle_render_dump_vblank = 0;
             static int idle_render_dumps = 0;
+            static uint64_t last_create_value = 0;
+            static uint64_t last_create_change_vblank = 0;
             const auto renderer_heartbeat = [&]() {
                 if (!emuenv.renderer)
                     return;
@@ -255,6 +302,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 stuck_scene_alive_noted = false;
                 last_idle_render_dump_vblank = 0;
                 idle_render_dumps = 0;
+                last_create_value = 0;
+                last_create_change_vblank = 0;
             }
             last_seen_vblanks = vblanks;
             const bool unpaused = !emuenv.kernel.is_threads_paused();
@@ -272,6 +321,14 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
             const uint64_t renderer_idle_vblanks = vblanks - last_progress_change_vblank;
             const uint64_t guest_idle_vblanks = vblanks - last_wake_change_vblank;
+            constexpr uint64_t THREAD_CREATE_QUIET_VBLANKS = 300; // ~5s
+            const uint64_t creates_now = emuenv.kernel.thread_create_counter.load(std::memory_order_relaxed);
+            if (creates_now != last_create_value) {
+                last_create_value = creates_now;
+                last_create_change_vblank = vblanks;
+            }
+            const uint64_t create_idle_vblanks = vblanks - last_create_change_vblank;
+            const bool guest_creating_threads = create_idle_vblanks < THREAD_CREATE_QUIET_VBLANKS;
 
             // Flip tracing - only us while chasing a freeze
             constexpr bool log_flip_trace = false;
@@ -391,7 +448,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 last_provable_dryrun_setframe = setframe;
                 emuenv.kernel.try_break_provable_evf_cycle(true);
             }
-            if (!never_flipped && stall_vblanks > PROVABLE_BREAK_VBLANKS && unpaused && renderer_idle_vblanks > PROVABLE_BREAK_VBLANKS && world_stop_quiet && mem_transition_quiet && last_provable_break_setframe != setframe) {
+            if (!never_flipped && stall_vblanks > PROVABLE_BREAK_VBLANKS && unpaused && renderer_idle_vblanks > PROVABLE_BREAK_VBLANKS && world_stop_quiet && mem_transition_quiet && !guest_creating_threads && last_provable_break_setframe != setframe) {
 #ifdef _WIN32
                 // if (!IsDebuggerPresent())  // Debug speed can make a normal load look exactly like a wedge hang
 #endif
@@ -401,7 +458,11 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                         provable_handed_over = true;
                         LOG_ERROR("HANG WATCHDOG: the game wedged again {} vblanks after the last provable-cycle release, leaving this wedge to the stall breaker", setframe - last_provable_break_vblank);
                     }
-                    if (!provable_handed_over) {
+                    std::string assert_note;
+                    const bool held_for_assert = guest_assert_holds_breakers(assert_note);
+                    if (!assert_note.empty())
+                        LOG_ERROR("HANG WATCHDOG: breakers held for the rest of this boot - a guest library trapped on a broken invariant: {}", assert_note);
+                    if (!provable_handed_over && !held_for_assert) {
                         const int broken = emuenv.kernel.try_break_provable_evf_cycle();
                         if (broken > 0) {
                             last_provable_break_setframe = setframe;
@@ -422,6 +483,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 const bool partial_wedge = stall_vblanks > BREAK_SLOW_VBLANKS && renderer_idle_vblanks > BREAK_SLOW_VBLANKS;
                 if (!full_wedge && !partial_wedge) {
                     LOG_INFO("HANG WATCHDOG: no flip for {} vblanks but still alive (renderer executed a command {} vblanks ago, a guest thread woke {} vblanks ago) — breaker suppressed", stall_vblanks, renderer_idle_vblanks, guest_idle_vblanks);
+                } else if (guest_creating_threads) {
+                    LOG_INFO("HANG WATCHDOG: no flip for {} vblanks, renderer idle {}, but the guest created a thread {} vblanks ago — loading, breakers held", stall_vblanks, renderer_idle_vblanks, create_idle_vblanks);
                 } else {
                     constexpr int MAX_BREAK_DUMPS_PER_STALL = 3;
                     if (break_dumps_this_stall < MAX_BREAK_DUMPS_PER_STALL) {
@@ -439,8 +502,14 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                         continue;
                     }*/
 #endif
-                    const int nudged = emuenv.kernel.try_break_frame_sync_deadlock(nudged_this_stall);
-                    if (nudged > 0) {
+                    std::string assert_note;
+                    const bool held_for_assert = guest_assert_holds_breakers(assert_note);
+                    if (!assert_note.empty())
+                        LOG_ERROR("HANG WATCHDOG: breakers held for the rest of this boot - a guest library trapped on a broken invariant: {}", assert_note);
+                    const int nudged = held_for_assert ? 0 : emuenv.kernel.try_break_frame_sync_deadlock(nudged_this_stall);
+                    if (held_for_assert) {
+                        LOG_ERROR("HANG WATCHDOG: no flip for {} vblanks after a guest assertion - not forcing event flags or condition variables", stall_vblanks);
+                    } else if (nudged > 0) {
                         LOG_ERROR("HANG WATCHDOG: deadlock breaker nudged {} stuck event flag(s) after {} vblanks stalled", nudged, stall_vblanks);
                     } else {
                         // No stuck event flag to nudge. Try the condvar path.
@@ -457,9 +526,19 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
         }
 
-        const auto time_ms = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto time_left = TARGET_MICRO_PER_FRAME - (time_ms % TARGET_MICRO_PER_FRAME);
-        std::this_thread::sleep_for(std::chrono::microseconds(time_left));
+        const auto time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto time_left = VBLANK_PERIOD_NS - (time_ns % VBLANK_PERIOD_NS);
+        if (display.fps_hack) {
+            if (time_left > VBLANK_PERIOD_NS / 2) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(time_left - VBLANK_PERIOD_NS / 2));
+                wake_half_vblank_waiters(display);
+            }
+            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+            if (time_ns + time_left > now_ns)
+                std::this_thread::sleep_for(std::chrono::nanoseconds(time_ns + time_left - now_ns));
+        } else {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(time_left));
+        }
     }
 
     watchdog.join();
@@ -469,7 +548,7 @@ void start_sync_thread(EmuEnvState &emuenv) {
     emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
 }
 
-void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb) {
+void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePtr &wait_thread, const uint64_t target_vcount, const bool is_cb, const bool wake_at_half_vblank) {
     if (!wait_thread) {
         return;
     }
@@ -484,7 +563,7 @@ void wait_vblank(DisplayState &display, KernelState &kernel, const ThreadStatePt
                 return;
 
             wait_thread->update_status(ThreadStatus::wait);
-            display.vblank_wait_infos.push_back({ wait_thread, target_vcount });
+            display.vblank_wait_infos.push_back({ wait_thread, target_vcount, wake_at_half_vblank });
         }
 
         wait_thread->status_cond.wait(thread_lock, [&]() {

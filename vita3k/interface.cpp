@@ -20,6 +20,7 @@
 
 #include "module/load_module.h"
 
+#include <cheat/functions.h>
 #include <config/state.h>
 #include <ctime>
 #include <ctrl/state.h>
@@ -517,6 +518,30 @@ static void do_patches(MemState &mem, const Patches &patches, const SceKernelMod
     }
 }
 
+// Registers the modules a `$B2` code can pick from along with the cheat file of the title.
+static void load_cheats(EmuEnvState &emuenv, const SceKernelModuleInfo &module_info) {
+    cheat::unload(emuenv.cheat);
+
+    const cheat::JitInvalidate invalidate_jit = [&emuenv](uint32_t address, size_t size) {
+        emuenv.kernel.invalidate_jit_cache(address, size);
+    };
+    cheat::set_enabled(emuenv.cheat, emuenv.cfg.enable_cheats, emuenv.mem, invalidate_jit);
+
+    // A `$B2` code with module index 0 refers to the main executable.
+    CheatModule main_module;
+    main_module.name = std::string(module_info.module_name, strnlen(module_info.module_name, sizeof(module_info.module_name)));
+    static_assert(main_module.segments.size() == MODULE_INFO_NUM_SEGMENTS);
+    for (size_t i = 0; i < main_module.segments.size(); i++) {
+        main_module.segments[i].address = module_info.segments[i].vaddr.address();
+        main_module.segments[i].size = module_info.segments[i].memsz;
+    }
+    cheat::add_module(emuenv.cheat, main_module);
+
+    if (cheat::load(emuenv.cheat, emuenv.cheat_path, emuenv.io.title_id)) {
+        LOG_INFO("{} cheats are turned on for {}", cheat::enabled_cheat_count(emuenv.cheat), emuenv.io.title_id);
+    }
+}
+
 static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const AppLaunchRequest &launch_request) {
     const auto call_import = [&emuenv](CPUState &cpu, uint32_t nid, SceUID thread_id) {
         ::call_import(emuenv, cpu, nid, thread_id);
@@ -525,17 +550,23 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
         emuenv.post_app_launch_request(relaunch.value_or(AppLaunchRequest{ .reason = AppLaunchReason::ProcessExit }));
     };
     emuenv.kernel.accurate_thread_scheduling = emuenv.cfg.current_config.accurate_thread_scheduling;
-    emuenv.kernel.preempt_on_wake = emuenv.cfg.current_config.preempt_on_wake;
+    // preempt-on-wake goes with accurate thread scheduling on every platform
+    emuenv.kernel.preempt_on_wake = emuenv.cfg.current_config.accurate_thread_scheduling;
     emuenv.kernel.preempt_on_wake_us = emuenv.cfg.current_config.preempt_on_wake_us;
-    LOG_INFO("CONFIG (applied): memory_mapping={} accurate_thread_scheduling={} preempt_on_wake={} high_accuracy={} res_multiplier={} guest_cores={}",
+    LOG_INFO("CONFIG (applied): memory_mapping={} accurate_thread_scheduling={} preempt_on_wake={} high_accuracy={} res_multiplier={} guest_cores={} disable_surface_sync={} file_loading_delay={}",
         emuenv.cfg.current_config.memory_mapping, emuenv.cfg.current_config.accurate_thread_scheduling,
-        emuenv.cfg.current_config.preempt_on_wake,
-        emuenv.cfg.current_config.high_accuracy, emuenv.cfg.current_config.resolution_multiplier, emuenv.cfg.current_config.guest_cores);
+        emuenv.kernel.preempt_on_wake,
+        emuenv.cfg.current_config.high_accuracy, emuenv.cfg.current_config.resolution_multiplier, emuenv.cfg.current_config.guest_cores,
+        emuenv.cfg.current_config.disable_surface_sync, emuenv.cfg.current_config.file_loading_delay);
     guest_sched_set_cores(emuenv.cfg.current_config.guest_cores);
     if (emuenv.kernel.accurate_thread_scheduling)
         LOG_INFO("Accurate thread scheduling enabled: default-affinity guest threads run one at a time, by priority");
     if (emuenv.kernel.preempt_on_wake)
-        LOG_INFO("Preempt-on-wake enabled ({}us window): a thread that wakes a higher-priority thread yields the host CPU so the woken thread runs first", emuenv.kernel.preempt_on_wake_us);
+        LOG_INFO("Preempt-on-wake enabled ({}us window): a thread that wakes a higher-priority thread waits for it only when the woken thread has no free core to run on", emuenv.kernel.preempt_on_wake_us);
+    static uint32_t game_boots = 0;
+    game_boots++;
+    core_lock_begin_boot(game_boots);
+    guest_assert_begin_boot();
 
     if (!emuenv.kernel.init(emuenv.mem, call_import, emuenv.cfg.current_config.cpu_opt)) {
         LOG_WARN("Failed to init kernel!");
@@ -576,6 +607,14 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
 
     LOG_INFO("Title: {}", emuenv.current_app_title);
     LOG_INFO("Serial: {}", emuenv.io.title_id);
+    const TitleFileLoadingDelay title_delay = find_title_file_loading_delay(emuenv.io.title_id);
+    emuenv.io.title_file_loading_delay = title_delay.delay;
+    if (title_delay.delay > 0) {
+        if (emuenv.cfg.current_config.file_loading_delay > 0)
+            LOG_INFO("File loading delay: {} ms from settings; the title table's {} ms for {} is not used", emuenv.cfg.current_config.file_loading_delay, title_delay.delay, title_delay.game);
+        else
+            LOG_INFO("File loading delay: {} ms for {} from the title table (the setting is 0)", title_delay.delay, title_delay.game);
+    }
     LOG_INFO("Version: {}", emuenv.app_info.app_version);
     LOG_INFO("Category: {}", emuenv.app_info.app_category);
 
@@ -604,6 +643,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
         const Patches patches = get_patches(emuenv.patch_path, emuenv.io.title_id, "app0:" + emuenv.self_path);
         if (!patches.empty())
             do_patches(emuenv.mem, patches, module->info);
+        load_cheats(emuenv, module->info);
     } else
         return FileNotFound;
     // Set self name from self path, can contain folder, get file name only
