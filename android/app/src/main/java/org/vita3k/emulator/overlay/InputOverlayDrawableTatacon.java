@@ -62,6 +62,18 @@ public final class InputOverlayDrawableTatacon
 
   public int getControl(int zone) { return mControls[zone]; }
 
+  /** 鼓面区域（don）。外圈（ka）返回 false。 */
+  public static boolean isHeadZone(int zone)
+  {
+    return zone == ZONE_UP || zone == ZONE_DOWN || zone == ZONE_CIRCLE || zone == ZONE_CROSS;
+  }
+
+  /** 鼓的左半边。用于识别双指同时敲击两侧的“大音符”。 */
+  public static boolean isLeftSideZone(int zone)
+  {
+    return zone == ZONE_UP || zone == ZONE_DOWN || zone == ZONE_RIM_LEFT;
+  }
+
   public void setTrackId(int trackId) { mTrackId = trackId; }
   public int getTrackId() { return mTrackId; }
 

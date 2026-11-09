@@ -55,6 +55,21 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   private final static long HAPTIC_RAPID_WINDOW_MS = 85;
   private static long sLastVibrateTime = 0;
 
+  // Taiko "big note": two fingers landing almost together on opposite sides of the same
+  // part of the drum (head with head, rim with rim) get a longer, heavier pulse that
+  // replaces the first hit's vibration. Ported from the Azahar/Dolphin tatacon.
+  private final static long TATACON_BIG_HIT_PAIR_WINDOW_MS = 25;
+  private final static long TATACON_BIG_HIT_QUIET_BEFORE_MS = 110;
+  private final static long TATACON_BIG_HIT_DURATION_MS = 130;
+
+  // Tatacon hits keep their own timing so a big note can replace the first hit's pulse
+  // without disturbing the shared button/dpad/joystick debounce.
+  private long mLastTataconHapticTime = 0; // last vibration actually fired
+  private long mLastTataconHitTime = 0;    // last hit, even if its vibration was debounced
+  private long mPrevTataconHitTime = 0;    // the hit before mLastTataconHitTime
+  private int mLastTataconHitZone = InputOverlayDrawableTatacon.ZONE_NONE;
+  private boolean mLastTataconPairWasBig = false;
+
   private final Set<InputOverlayDrawableButton> overlayButtons = new HashSet<>();
   private final Set<InputOverlayDrawableDpad> overlayDpads = new HashSet<>();
   private final Set<InputOverlayDrawableJoystick> overlayJoysticks = new HashSet<>();
@@ -684,7 +699,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
               if (zone != InputOverlayDrawableTatacon.ZONE_NONE)
               {
                 setButton(tatacon.getControl(zone), true);
-                triggerHapticFeedback(); // Taiko drum hit
+                triggerTataconHapticFeedback(zone, event.getEventTime()); // Taiko drum hit
               }
               tatacon.setActiveZone(zone);
             }
@@ -749,6 +764,77 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       amplitude = strength;
     }
 
+    vib.vibrate(VibrationEffect.createOneShot(duration, amplitude));
+  }
+
+  /**
+   * Haptic feedback for a taiko drum hit, including the two-finger "big note" handling
+   * from the Azahar/Dolphin tatacon.
+   *
+   * The first hit always vibrates immediately, so single notes stay responsive. When a
+   * second finger lands on the opposite side of the same part (head with head, rim with
+   * rim) within TATACON_BIG_HIT_PAIR_WINDOW_MS, and the pair is isolated from previous
+   * hits, it gets a longer, heavier pulse that replaces the first one. Both start at the
+   * configured amplitude, so the replacement is seamless.
+   *
+   * @param zone      drum zone that was just pressed
+   * @param eventTime MotionEvent.getEventTime(), unaffected by main thread jitter
+   */
+  private void triggerTataconHapticFeedback(int zone, long eventTime) {
+    if (mOverlayConfig == null || mOverlayConfig.hapticAmplitude <= 0)
+      return;
+
+    Context ctx = getContext();
+    if (ctx == null)
+      return;
+
+    Vibrator vib = (Vibrator) ctx.getSystemService(Context.VIBRATOR_SERVICE);
+    if (vib == null || !vib.hasVibrator())
+      return;
+
+    final int previousZone = mLastTataconHitZone;
+    final boolean isBigPair = previousZone != InputOverlayDrawableTatacon.ZONE_NONE
+            && eventTime - mLastTataconHitTime >= 0
+            && eventTime - mLastTataconHitTime <= TATACON_BIG_HIT_PAIR_WINDOW_MS
+            && InputOverlayDrawableTatacon.isHeadZone(previousZone)
+                    == InputOverlayDrawableTatacon.isHeadZone(zone)
+            && InputOverlayDrawableTatacon.isLeftSideZone(previousZone)
+                    != InputOverlayDrawableTatacon.isLeftSideZone(zone)
+            && !mLastTataconPairWasBig
+            && mLastTataconHitTime - mPrevTataconHitTime >= TATACON_BIG_HIT_QUIET_BEFORE_MS;
+
+    mPrevTataconHitTime = mLastTataconHitTime;
+    mLastTataconHitTime = eventTime;
+    mLastTataconHitZone = zone;
+    mLastTataconPairWasBig = isBigPair;
+
+    final int strength = mOverlayConfig.hapticAmplitude; // 1..255, 0 handled above
+
+    if (isBigPair) {
+      // Bypasses the debounce on purpose; replaces the first hit's pulse.
+      mLastTataconHapticTime = eventTime;
+      sLastVibrateTime = eventTime; // keep other controls' shared debounce in sync
+      vib.vibrate(VibrationEffect.createOneShot(TATACON_BIG_HIT_DURATION_MS, strength));
+      return;
+    }
+
+    final long delta = eventTime - mLastTataconHapticTime;
+    if (delta < HAPTIC_DEBOUNCE_MS)
+      return;
+    mLastTataconHapticTime = eventTime; // only hits that vibrate restart the window
+    sLastVibrateTime = eventTime;       // keep other controls' shared debounce in sync
+
+    final float norm = strength / 255f;
+    final int duration;
+    final int amplitude;
+    if (delta < HAPTIC_RAPID_WINDOW_MS) {
+      // Same rolling pulse as the generic haptics so fast rolls stay smooth.
+      duration = 50 + Math.round(norm * 15f);
+      amplitude = Math.max(1, Math.round(strength * 0.33f));
+    } else {
+      duration = 45 + Math.round(norm * 40f);
+      amplitude = strength;
+    }
     vib.vibrate(VibrationEffect.createOneShot(duration, amplitude));
   }
 
