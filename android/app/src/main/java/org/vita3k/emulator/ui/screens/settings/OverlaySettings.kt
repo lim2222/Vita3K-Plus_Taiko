@@ -302,18 +302,35 @@ internal fun OverlaySettingsRows(
             onShowHelp = onShowHelp
         )
         SettingsSliderRow(
-            title = stringResource(R.string.settings_controls_opacity),
-            valueLabel = stringResource(R.string.settings_controls_percent_value, overlayConfig.overlayOpacity),
-            value = overlayConfig.overlayOpacity.toFloat(),
+            title = stringResource(R.string.settings_controls_opacity_portrait),
+            valueLabel = stringResource(R.string.settings_controls_percent_value, overlayConfig.overlayOpacityPortrait),
+            value = overlayConfig.overlayOpacityPortrait.toFloat(),
             onValueChange = {
-                onOverlayConfigChange(overlayConfig.copy(overlayOpacity = it.toInt()))
+                onOverlayConfigChange(overlayConfig.copy(overlayOpacityPortrait = it.toInt()))
             },
             valueRange = 20f..100f,
             steps = 79,
             enabled = overlayConfig.controlsVisible,
             help = SettingsHelpEntry(
-                title = stringResource(R.string.settings_controls_opacity),
-                body = stringResource(R.string.settings_controls_opacity_desc),
+                title = stringResource(R.string.settings_controls_opacity_portrait),
+                body = stringResource(R.string.settings_controls_opacity_portrait_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
+        SettingsSliderRow(
+            title = stringResource(R.string.settings_controls_opacity_landscape),
+            valueLabel = stringResource(R.string.settings_controls_percent_value, overlayConfig.overlayOpacityLandscape),
+            value = overlayConfig.overlayOpacityLandscape.toFloat(),
+            onValueChange = {
+                onOverlayConfigChange(overlayConfig.copy(overlayOpacityLandscape = it.toInt()))
+            },
+            valueRange = 20f..100f,
+            steps = 79,
+            enabled = overlayConfig.controlsVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_opacity_landscape),
+                body = stringResource(R.string.settings_controls_opacity_landscape_desc),
                 scope = SettingsScope.Global
             ),
             onShowHelp = onShowHelp

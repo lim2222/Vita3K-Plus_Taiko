@@ -32,7 +32,8 @@ data class EmulationSessionUiState(
     val touchSwitchVisible: Boolean = true,
     val hideToggleVisible: Boolean = false,
     val overlayScale: Int = 100,
-    val overlayOpacity: Int = 100,
+    val overlayOpacityPortrait: Int = 100,
+    val overlayOpacityLandscape: Int = 100,
     val hideOverlayWhenControllerConnected: Boolean = true,
     val hapticAmplitude: Int = 255,
     val hideOverlayTimeSeconds: Int = 10,
@@ -119,7 +120,6 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
 
     fun applyOverlayState(emulator: Emulator) {
         emulator.setControllerOverlayScale(uiState.overlayScale / 100f)
-        emulator.setControllerOverlayOpacity(uiState.overlayOpacity)
         emulator.setControllerOverlayLayout(uiState.overlayLayout)
         val visibleMask = when {
             uiState.showMenu -> 0
@@ -269,8 +269,12 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
         updateOverlayConfig(emulator) { it.copy(overlayScale = value) }
     }
 
-    fun setOverlayOpacity(emulator: Emulator, value: Int) {
-        updateOverlayConfig(emulator) { it.copy(overlayOpacity = value) }
+    fun setOverlayOpacityPortrait(emulator: Emulator, value: Int) {
+        updateOverlayConfig(emulator) { it.copy(overlayOpacityPortrait = value) }
+    }
+
+    fun setOverlayOpacityLandscape(emulator: Emulator, value: Int) {
+        updateOverlayConfig(emulator) { it.copy(overlayOpacityLandscape = value) }
     }
 
     fun setControllerConnected(emulator: Emulator, connected: Boolean) {
@@ -353,7 +357,8 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             overlayMask = uiState.overlayMask,
 			visibleButtons = uiState.visibleButtons,
             overlayScale = uiState.overlayScale,
-            overlayOpacity = uiState.overlayOpacity,
+            overlayOpacityPortrait = uiState.overlayOpacityPortrait,
+            overlayOpacityLandscape = uiState.overlayOpacityLandscape,
             hideOverlayWhenControllerConnected = uiState.hideOverlayWhenControllerConnected,
             hapticAmplitude = uiState.hapticAmplitude,
             hideOverlayTimeSeconds = uiState.hideOverlayTimeSeconds,
@@ -459,7 +464,8 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             touchSwitchVisible = normalized.touchSwitchVisible,
             hideToggleVisible = normalized.hideToggleVisible,
             overlayScale = normalized.overlayScale,
-            overlayOpacity = normalized.overlayOpacity,
+            overlayOpacityPortrait = normalized.overlayOpacityPortrait,
+            overlayOpacityLandscape = normalized.overlayOpacityLandscape,
             hideOverlayWhenControllerConnected = normalized.hideOverlayWhenControllerConnected,
             hapticAmplitude = normalized.hapticAmplitude,
             hideOverlayTimeSeconds = normalized.hideOverlayTimeSeconds,

@@ -23,6 +23,8 @@ object OverlayStore {
 	private const val KEY_VISIBLE_BUTTONS = "visible_buttons"
     private const val KEY_OVERLAY_SCALE = "overlay_scale"
     private const val KEY_OVERLAY_OPACITY = "overlay_opacity"
+    private const val KEY_OVERLAY_OPACITY_PORTRAIT = "overlay_opacity_portrait"
+    private const val KEY_OVERLAY_OPACITY_LANDSCAPE = "overlay_opacity_landscape"
     private const val KEY_HIDE_ON_CONTROLLER = "hide_overlay_on_controller"
     private const val KEY_HAPTIC_AMPLITUDE = "haptic_amplitude"
     private const val KEY_HIDE_OVERLAY_TIME = "hide_overlay_time"
@@ -247,8 +249,12 @@ object OverlayStore {
                 normalizedState.config.overlayScale
             )
             putInt(
-                configKey(normalizedScopeId, KEY_OVERLAY_OPACITY),
-                normalizedState.config.overlayOpacity
+                configKey(normalizedScopeId, KEY_OVERLAY_OPACITY_PORTRAIT),
+                normalizedState.config.overlayOpacityPortrait
+            )
+            putInt(
+                configKey(normalizedScopeId, KEY_OVERLAY_OPACITY_LANDSCAPE),
+                normalizedState.config.overlayOpacityLandscape
             )
             putBoolean(
                 configKey(normalizedScopeId, KEY_HIDE_ON_CONTROLLER),
@@ -280,6 +286,8 @@ object OverlayStore {
         val visibleButtonsKey = configKey(scopeId, KEY_VISIBLE_BUTTONS)
         val scaleKey = configKey(scopeId, KEY_OVERLAY_SCALE)
         val opacityKey = configKey(scopeId, KEY_OVERLAY_OPACITY)
+        val opacityPortraitKey = configKey(scopeId, KEY_OVERLAY_OPACITY_PORTRAIT)
+        val opacityLandscapeKey = configKey(scopeId, KEY_OVERLAY_OPACITY_LANDSCAPE)
         val hideOnControllerKey = configKey(scopeId, KEY_HIDE_ON_CONTROLLER)
         val hapticAmplitudeKey = configKey(scopeId, KEY_HAPTIC_AMPLITUDE)
         val hideOverlayTimeKey = configKey(scopeId, KEY_HIDE_OVERLAY_TIME)
@@ -301,7 +309,16 @@ object OverlayStore {
             overlayMask = overlayMask,
             visibleButtons = visibleButtons,
             overlayScale = prefs.getInt(scaleKey, fallback.overlayScale),
-            overlayOpacity = prefs.getInt(opacityKey, fallback.overlayOpacity),
+            // Configs saved before opacity became per-orientation only have the
+            // shared key, so both orientations inherit it until each is changed.
+            overlayOpacityPortrait = prefs.getInt(
+                opacityPortraitKey,
+                prefs.getInt(opacityKey, fallback.overlayOpacityPortrait)
+            ),
+            overlayOpacityLandscape = prefs.getInt(
+                opacityLandscapeKey,
+                prefs.getInt(opacityKey, fallback.overlayOpacityLandscape)
+            ),
             hideOverlayWhenControllerConnected = prefs.getBoolean(
                 hideOnControllerKey,
                 fallback.hideOverlayWhenControllerConnected
@@ -441,9 +458,13 @@ object OverlayStore {
                     KEY_OVERLAY_SCALE,
                     defaultState.config.overlayScale
                 ),
-                overlayOpacity = legacyConfigPrefs.getInt(
+                overlayOpacityPortrait = legacyConfigPrefs.getInt(
                     KEY_OVERLAY_OPACITY,
-                    defaultState.config.overlayOpacity
+                    defaultState.config.overlayOpacityPortrait
+                ),
+                overlayOpacityLandscape = legacyConfigPrefs.getInt(
+                    KEY_OVERLAY_OPACITY,
+                    defaultState.config.overlayOpacityLandscape
                 ),
                 hideOverlayWhenControllerConnected = legacyConfigPrefs.getBoolean(
                     KEY_HIDE_ON_CONTROLLER,
@@ -509,6 +530,8 @@ object OverlayStore {
 		editor.remove(configKey(scopeId, KEY_VISIBLE_BUTTONS))
         editor.remove(configKey(scopeId, KEY_OVERLAY_SCALE))
         editor.remove(configKey(scopeId, KEY_OVERLAY_OPACITY))
+        editor.remove(configKey(scopeId, KEY_OVERLAY_OPACITY_PORTRAIT))
+        editor.remove(configKey(scopeId, KEY_OVERLAY_OPACITY_LANDSCAPE))
         editor.remove(configKey(scopeId, KEY_HIDE_ON_CONTROLLER))
         editor.remove(configKey(scopeId, KEY_HIDE_OVERLAY_TIME))
         defaultEntries.forEach { entry ->

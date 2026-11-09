@@ -43,7 +43,6 @@ internal fun OverlayLayoutEditorDialog(
     val setAutoHideEnabledMethod = InputOverlay::class.java.getMethod("setAutoHideEnabled", Boolean::class.java)
     val setIsInEditModeMethod = InputOverlay::class.java.getMethod("setIsInEditMode", Boolean::class.java)
     val setScaleMethod = InputOverlay::class.java.getMethod("setScale", Float::class.java)
-    val setOpacityMethod = InputOverlay::class.java.getMethod("setOpacity", Int::class.java)
     val setStateMethod = InputOverlay::class.java.getMethod("setState", Int::class.java)
     val setEditModeMethod = InputOverlay::class.java.getMethod("setEditMode", InputOverlay.EditMode::class.java)
     val setScreenOrientationMethod = InputOverlay::class.java.getMethod("setScreenOrientation", Int::class.java)
@@ -99,7 +98,6 @@ internal fun OverlayLayoutEditorDialog(
                         setAutoHideEnabledMethod.invoke(this, false)
                         setIsInEditModeMethod.invoke(this, true)
                         setScaleMethod.invoke(this, overlayConfig.overlayScale / 100f)
-                        setOpacityMethod.invoke(this, overlayConfig.overlayOpacity)
                         setStateMethod.invoke(this, overlayConfig.activeMask())
                     } catch (e: Exception) {
                         e.printStackTrace()
@@ -115,7 +113,6 @@ internal fun OverlayLayoutEditorDialog(
                     setAutoHideEnabledMethod.invoke(view, false)
                     setIsInEditModeMethod.invoke(view, true)
                     setScaleMethod.invoke(view, overlayConfig.overlayScale / 100f)
-                    setOpacityMethod.invoke(view, overlayConfig.overlayOpacity)
                     setStateMethod.invoke(view, overlayConfig.activeMask())
                 } catch (e: Exception) {
                     e.printStackTrace()

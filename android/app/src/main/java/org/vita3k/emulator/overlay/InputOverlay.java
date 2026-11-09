@@ -268,7 +268,21 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       resetHideTimer();
     }
 
-    invalidate();
+    // Opacity is per orientation, so apply it here as well: the running overlay
+    // only receives the full config (scale/layout have their own setters).
+    int resolvedOpacity = resolveConfiguredOpacity();
+    if (resolvedOpacity != mOpacity) {
+      mOpacity = resolvedOpacity;
+      refreshControls();
+    } else {
+      invalidate();
+    }
+  }
+
+  private int resolveConfiguredOpacity() {
+    if (mOverlayConfig == null)
+      return mOpacity;
+    return mOverlayConfig.opacityFor(isPortraitMode());
   }
 
 
@@ -992,6 +1006,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
   public void refreshControls()
   {
+    // Opacity can differ between portrait and landscape, so re-resolve it here;
+    // rotation changes call refreshControls() and must pick up the new value.
+    mOpacity = resolveConfiguredOpacity();
     int touchSwitchState = 0;
     for (InputOverlayDrawableButton button : overlayButtons)
       if (button.getLegacyId() == ButtonType.BUTTON_TOUCH_SWITCH)
@@ -1032,10 +1049,14 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   }
 
   public void setOpacity(int opacity){
-    if (opacity != mOpacity){
-      mOpacity = opacity;
-      refreshControls();
+    int clamped = Math.max(20, Math.min(100, opacity));
+    if (clamped == mOpacity)
+      return;
+    if (mOverlayConfig != null) {
+      mOverlayConfig = mOverlayConfig.withOpacity(isPortraitMode(), clamped);
     }
+    mOpacity = clamped;
+    refreshControls();
   }
 
   private void saveControlPosition(int buttonType, Rect bounds, float scale) {
@@ -1526,7 +1547,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     OverlayConfig normalizedConfig = resolvedState.getConfig().normalized();
 	mOverlayConfig = normalizedConfig;
     float resolvedScale = normalizedConfig.overlayScale / 100f;
-	int resolvedOpacity = normalizedConfig.overlayOpacity;
+	int resolvedOpacity = normalizedConfig.opacityFor(isPortraitMode());
     boolean resolvedTouchSwitchTilt = normalizedConfig.touchSwitchTilt;
     boolean changed = !normalizedLayout.equals(mLayout)
             || Float.compare(mScale, resolvedScale) != 0

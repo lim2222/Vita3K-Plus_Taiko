@@ -16,7 +16,9 @@ data class OverlayConfig(
     val overlayScale: Int = 100,
 
     @JvmField
-    val overlayOpacity: Int = 100,
+    val overlayOpacityPortrait: Int = 100,
+    @JvmField
+    val overlayOpacityLandscape: Int = 100,
     @JvmField
     val hideOverlayWhenControllerConnected: Boolean = true,
 
@@ -52,6 +54,16 @@ data class OverlayConfig(
         get() = overlayMask and InputOverlay.OVERLAY_MASK_HIDE_TOGGLE != 0
 
     fun activeMask(): Int = if (overlayMask == 0) DEFAULT_OVERLAY_MASK else overlayMask
+
+    fun opacityFor(isPortrait: Boolean): Int =
+        if (isPortrait) overlayOpacityPortrait else overlayOpacityLandscape
+
+    fun withOpacity(isPortrait: Boolean, value: Int): OverlayConfig =
+        (if (isPortrait) {
+            copy(overlayOpacityPortrait = value)
+        } else {
+            copy(overlayOpacityLandscape = value)
+        }).normalized()
 
     fun withControlsVisible(visible: Boolean): OverlayConfig {
         return copy(overlayMask = if (visible) activeMask() else 0).normalized()
@@ -153,7 +165,8 @@ data class OverlayConfig(
             overlayMask = sanitizedMask,
             visibleButtons = buttons,
             overlayScale = overlayScale.coerceIn(50, 150),
-            overlayOpacity = overlayOpacity.coerceIn(20, 100),
+            overlayOpacityPortrait = overlayOpacityPortrait.coerceIn(20, 100),
+            overlayOpacityLandscape = overlayOpacityLandscape.coerceIn(20, 100),
             hideOverlayTimeSeconds = hideOverlayTimeSeconds.coerceIn(0, 300)
         )
     }

@@ -549,6 +549,10 @@
     <string name="settings_controls_scale_desc">Resize the touch controls to better fit your hands and screen.</string>
     <string name="settings_controls_opacity">Overlay Opacity</string>
     <string name="settings_controls_opacity_desc">Adjust how transparent the touch controls appear over the game.</string>
+    <string name="settings_controls_opacity_portrait">Overlay Opacity (Portrait)</string>
+    <string name="settings_controls_opacity_portrait_desc">Adjust how transparent the touch controls appear in portrait orientation.</string>
+    <string name="settings_controls_opacity_landscape">Overlay Opacity (Landscape)</string>
+    <string name="settings_controls_opacity_landscape_desc">Adjust how transparent the touch controls appear in landscape orientation.</string>
     <string name="settings_controls_percent_value">%1$d%%</string>
     <string name="settings_controls_controller_connected">Controller connected</string>
     <string name="settings_controls_controller_disconnected">No controller connected</string>
