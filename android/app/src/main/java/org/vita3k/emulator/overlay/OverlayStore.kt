@@ -30,6 +30,7 @@ object OverlayStore {
     private const val KEY_BUTTON_SLIDE_MODE = "button_slide_mode"
     private const val KEY_HIDE_OVERLAY_TIME = "hide_overlay_time"
     private const val KEY_TOUCH_SWITCH_TILT = "overlay_touch_switch_tilt"
+    private const val KEY_FAST_FORWARD_SPEED = "fast_forward_speed"
     private const val KEY_CONFIG_PREFIX = "config"
     private const val KEY_LAYOUT_PREFIX = "layout"
     private const val KEY_POSITION_X_SUFFIX = ":x"
@@ -79,6 +80,7 @@ object OverlayStore {
         OverlayPositionDefaults(ButtonType.TRIGGER_R3, R.integer.TRIGGER_R3_X, R.integer.TRIGGER_R3_Y),
         OverlayPositionDefaults(ButtonType.BUTTON_TOUCH_HIDE, R.integer.BUTTON_TOUCH_HIDE_X, R.integer.BUTTON_TOUCH_HIDE_Y),
         OverlayPositionDefaults(ButtonType.BUTTON_TOUCH_SWITCH, R.integer.BUTTON_TOUCH_SWITCH_X, R.integer.BUTTON_TOUCH_SWITCH_Y),
+        OverlayPositionDefaults(ButtonType.BUTTON_FAST_FORWARD, R.integer.BUTTON_FAST_FORWARD_X, R.integer.BUTTON_FAST_FORWARD_Y),
 		OverlayPositionDefaults(ButtonType.TATACON, R.integer.BUTTON_TATACON_X, R.integer.BUTTON_TATACON_Y)
     )
 
@@ -274,6 +276,7 @@ object OverlayStore {
                 normalizedState.config.hideOverlayTimeSeconds
             )
             putBoolean(configKey(normalizedScopeId, KEY_TOUCH_SWITCH_TILT), normalizedState.config.touchSwitchTilt)
+            putInt(configKey(normalizedScopeId, KEY_FAST_FORWARD_SPEED), normalizedState.config.fastForwardSpeed)
             saveLayoutEntries(this, normalizedScopeId, normalizedState.layout)
             if (markOverride && normalizedScopeId.isNotEmpty()) {
                 putBoolean(overrideEnabledKey(normalizedScopeId), true)
@@ -334,6 +337,7 @@ object OverlayStore {
                 fallback.buttonSlideMode
             ),
             hideOverlayTimeSeconds = prefs.getInt(hideOverlayTimeKey, fallback.hideOverlayTimeSeconds),
+            fastForwardSpeed = prefs.getInt(configKey(scopeId, KEY_FAST_FORWARD_SPEED), fallback.fastForwardSpeed),
             touchSwitchTilt = prefs.getBoolean(configKey(scopeId, KEY_TOUCH_SWITCH_TILT), fallback.touchSwitchTilt)
         ).normalized()
     }
@@ -543,6 +547,7 @@ object OverlayStore {
         editor.remove(configKey(scopeId, KEY_OVERLAY_OPACITY_LANDSCAPE))
         editor.remove(configKey(scopeId, KEY_HIDE_ON_CONTROLLER))
         editor.remove(configKey(scopeId, KEY_HIDE_OVERLAY_TIME))
+        editor.remove(configKey(scopeId, KEY_FAST_FORWARD_SPEED))
         defaultEntries.forEach { entry ->
             // Remove both portrait and landscape keys
             editor.remove(positionKey(scopeId, entry.buttonType, KEY_POSITION_X_SUFFIX, true))

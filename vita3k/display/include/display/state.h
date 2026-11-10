@@ -80,6 +80,17 @@ struct DisplayState {
     std::atomic<uint64_t> last_setframe_vblank_count = 0;
     std::map<SceUID, CallbackPtr> vblank_callbacks{};
 
+    // Overlay fast forward: the vblank thread ticks this many times per real
+    // 60 Hz frame. 1 = normal speed, 2..4 = fast forward.
+    std::atomic<int> fast_forward_speed{ 1 };
+
+    // Host time (microseconds, steady clock) of the last accepted
+    // sceDisplaySetFrameBuf. Fast forward suspends itself while no frame has
+    // been presented for a while, which is what loading screens look like: they
+    // are IO/CPU bound, so speeding up the guest clock only risks their already
+    // fragile event-flag handshakes.
+    std::atomic<uint64_t> last_setframe_host_us{ 0 };
+
     // if set to true, make sceDisplayWaitVblankStartMulti/sceDisplayWaitSetFrameBufMulti behave as sceDisplayWaitVblankStart/sceDisplayWaitSetFrameBuf
     // this allows some game running at 30fps to run at 60fps without any issue
     // however this is not always the case, some games may not be affected (if they look at the Vcount)

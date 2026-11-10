@@ -44,6 +44,7 @@ private fun officialButtonName(legacyId: Int): String = when (legacyId) {
     ButtonType.BUTTON_TOUCH_SWITCH -> "Touch Switch"
     ButtonType.BUTTON_TOUCH_HIDE -> "Hide Toggle"
 	ButtonType.TATACON -> "Taiko Drum"
+    ButtonType.BUTTON_FAST_FORWARD -> "Fast Forward"
     else -> "Button $legacyId"
 }
 
@@ -145,11 +146,12 @@ internal fun OverlaySettingsRows(
             id != ButtonType.TRIGGER_R2 &&
             id != ButtonType.TRIGGER_L3 &&
             id != ButtonType.TRIGGER_R3 &&
-            // Utility buttons (Touch Switch / Hide Toggle) have their own dedicated
-            // toggle rows below; showing them here too would require enabling two
-            // switches for a single button.
+            // Utility buttons (Touch Switch / Hide Toggle / Fast Forward) have their own
+            // dedicated toggle rows below; showing them here too would require enabling
+            // two switches for a single button.
             id != ButtonType.BUTTON_TOUCH_SWITCH &&
-            id != ButtonType.BUTTON_TOUCH_HIDE
+            id != ButtonType.BUTTON_TOUCH_HIDE &&
+            id != ButtonType.BUTTON_FAST_FORWARD
         }.forEach { id ->
             SettingsToggleRow(
                 title = officialButtonName(id),
@@ -310,6 +312,39 @@ internal fun OverlaySettingsRows(
             help = SettingsHelpEntry(
                 title = stringResource(R.string.settings_controls_hide_toggle),
                 body = stringResource(R.string.settings_controls_hide_toggle_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
+        SettingsToggleRow(
+            title = stringResource(R.string.settings_controls_fast_forward),
+            checked = overlayConfig.fastForwardVisible,
+            onCheckedChange = { onOverlayConfigChange(overlayConfig.withFastForwardVisible(it)) },
+            enabled = overlayConfig.controlsVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_fast_forward),
+                body = stringResource(R.string.settings_controls_fast_forward_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
+        val fastForwardSpeeds = listOf(2, 3, 4)
+        val fastForwardLabels = fastForwardSpeeds.map {
+            stringResource(R.string.settings_controls_fast_forward_speed_value, it)
+        }
+        val fastForwardIndex = fastForwardSpeeds.indexOf(overlayConfig.fastForwardSpeed)
+            .let { if (it < 0) fastForwardSpeeds.indexOf(3) else it }
+        SettingsScrollableChoiceSelector(
+            title = stringResource(R.string.settings_controls_fast_forward_speed),
+            options = fastForwardLabels,
+            selectedIndex = fastForwardIndex,
+            onSelected = { index ->
+                onOverlayConfigChange(overlayConfig.copy(fastForwardSpeed = fastForwardSpeeds[index]))
+            },
+            enabled = overlayConfig.controlsVisible && overlayConfig.fastForwardVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_fast_forward_speed),
+                body = stringResource(R.string.settings_controls_fast_forward_speed_desc),
                 scope = SettingsScope.Global
             ),
             onShowHelp = onShowHelp

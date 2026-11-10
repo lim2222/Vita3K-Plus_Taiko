@@ -36,6 +36,9 @@ public final class InputOverlayDrawableButton
   private BitmapDrawable mThirdStateBitmap = null;
   private BitmapDrawable mTiltStateBitmap = null;
   private boolean mPressedState = false;
+  // Latched state for tool keys (fast forward): the button keeps showing its
+  // active artwork after the finger is lifted.
+  private boolean mToggled = false;
   private int mTouchSwitchState = 0;  // 0 = front, 1 = back, 2 = front+back
   private int mRole = 0;
   private float mEditModeAlphaMultiplier = 1.0f;
@@ -149,6 +152,10 @@ private float mScaleAtEditStart = 1.0f;
 
   public boolean getPressed() { return mPressedState; }
 
+  public void setToggled(boolean toggled) { mToggled = toggled; }
+
+  public boolean getToggled() { return mToggled; }
+
   public int getTouchSwitchState() { return mTouchSwitchState; }
 
   public void setThirdStateBitmap(Resources res, Bitmap bitmap)
@@ -217,7 +224,7 @@ private float mScaleAtEditStart = 1.0f;
         default: return mDefaultStateBitmap;
       }
     }
-    return mPressedState ? mPressedStateBitmap : mDefaultStateBitmap;
+    return (mToggled || mPressedState) ? mPressedStateBitmap : mDefaultStateBitmap;
   }
 
   public void setBounds(int left, int top, int right, int bottom)

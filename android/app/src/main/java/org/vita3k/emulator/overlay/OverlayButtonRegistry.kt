@@ -21,7 +21,8 @@ object OverlayButtonRegistry {
         ButtonType.TRIGGER_R3,        // bit 15
         ButtonType.BUTTON_TOUCH_SWITCH, // bit 16
         ButtonType.BUTTON_TOUCH_HIDE,   // bit 17
-        ButtonType.TATACON              // bit 18 — 之后加鼓时用
+        ButtonType.TATACON,             // bit 18 — 之后加鼓时用
+        ButtonType.BUTTON_FAST_FORWARD  // bit 19 — 快进工具键
     )
 
     fun bitFor(legacyId: Int): Long {
@@ -29,7 +30,10 @@ object OverlayButtonRegistry {
         return if (idx < 0) 0L else (1L shl idx)
     }
 
-    // 默认全开(不含鼓,鼓是新功能默认关闭,避免打扰现有用户)
+    // 默认全开(不含鼓和快进: 两者都是新功能,默认关闭避免打扰现有用户)
     fun defaultMask(): Long =
-        ids.fold(0L) { acc, id -> if (id == ButtonType.TATACON) acc else acc or bitFor(id) }
+        ids.fold(0L) { acc, id ->
+            if (id == ButtonType.TATACON || id == ButtonType.BUTTON_FAST_FORWARD) acc
+            else acc or bitFor(id)
+        }
 }

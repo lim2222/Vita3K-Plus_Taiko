@@ -26,6 +26,9 @@
 struct AudioBuffer {
     std::vector<uint8_t> buffer;
     int buffer_position;
+    // bytes of this slot that hold real audio; below len_bytes during fast
+    // forward, where the guest chunk is resampled to a shorter buffer
+    int valid_bytes;
 };
 
 struct CubebAudioOutPort : AudioOutPort {
@@ -39,8 +42,8 @@ struct CubebAudioOutPort : AudioOutPort {
     // position of the next audio buffer to put audio
     int next_audio_buffer = 0;
     int nb_buffers_ready = 0;
-    // bytes of the next ready buffer already handed to cubeb
-    int head_position = 0;
+    // bytes of real audio queued in the ready buffers (varies during FF)
+    int queued_bytes = 0;
     int frame_bytes = 0;
     // callback size cubeb reported, and the largest steady callback so far
     uint32_t latency_frames = 0;
@@ -62,7 +65,7 @@ public:
 
     bool init() override;
     AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) override;
-    void audio_output(AudioOutPort &out_port, const void *buffer) override;
+    void audio_output(AudioOutPort &out_port, const void *buffer, int bytes) override;
     void set_volume(AudioOutPort &out_port, float volume) override;
     int get_rest_sample(AudioOutPort &out_port) override;
     void switch_state(const bool pause) override;

@@ -77,7 +77,7 @@ public:
 
     virtual bool init() = 0;
     virtual AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) { return nullptr; }
-    virtual void audio_output(AudioOutPort &out_port, const void *buffer) {}
+    virtual void audio_output(AudioOutPort &out_port, const void *buffer, int bytes) {}
     virtual void set_volume(AudioOutPort &out_port, float volume) {}
     virtual void switch_state(const bool pause) {}
     virtual int get_rest_sample(AudioOutPort &out_port) { return 0; };
@@ -93,6 +93,11 @@ struct AudioState {
     AudioInPort in_port;
     std::string audio_backend;
     float global_volume = 1;
+
+    // Overlay fast forward multiplier (1 = normal). Above 1 the guest audio is
+    // resampled to play faster, so the guest sound thread keeps advancing at
+    // the same rate as the scaled guest clock and stays in sync after FF ends.
+    std::atomic<int> fast_forward_speed{ 1 };
 
     bool init(const std::string &adapter_name);
     void deinit();

@@ -27,9 +27,9 @@ static uint64_t steady_now_us() {
 }
 
 static int queued_frames(const CubebAudioOutPort &port) {
-    if (port.nb_buffers_ready <= 0 || port.frame_bytes == 0)
+    if (port.queued_bytes <= 0 || port.frame_bytes == 0)
         return 0;
-    return (port.nb_buffers_ready * port.len_bytes - port.head_position) / port.frame_bytes;
+    return port.queued_bytes / port.frame_bytes;
 }
 
 static int unplayed_frames(const CubebAudioOutPort &port, const uint64_t now) {
@@ -62,11 +62,11 @@ static long impl_cubeb_audio_callback(cubeb_stream *stream, void *user_data, con
     while (bytes_given < bytes_to_give && released < ready) {
         AudioBuffer &audio_buffer = port->audio_buffers[next];
         // compute the number of bytes we can copy from this buffer to the output
-        const int bytes_to_copy = std::min(bytes_to_give - bytes_given, port->len_bytes - audio_buffer.buffer_position);
+        const int bytes_to_copy = std::min(bytes_to_give - bytes_given, audio_buffer.valid_bytes - audio_buffer.buffer_position);
         memcpy(&output_buffer[bytes_given], &audio_buffer.buffer[audio_buffer.buffer_position], bytes_to_copy);
         audio_buffer.buffer_position += bytes_to_copy;
         bytes_given += bytes_to_copy;
-        if (audio_buffer.buffer_position == port->len_bytes) {
+        if (audio_buffer.buffer_position >= audio_buffer.valid_bytes) {
             next = (next + 1) % port->audio_buffers.size();
             released++;
         }
@@ -79,7 +79,7 @@ static long impl_cubeb_audio_callback(cubeb_stream *stream, void *user_data, con
     lock.lock();
     port->next_audio_buffer = next;
     port->nb_buffers_ready -= released;
-    port->head_position = port->nb_buffers_ready > 0 ? port->audio_buffers[next].buffer_position : 0;
+    port->queued_bytes = std::max(0, port->queued_bytes - bytes_given);
     if (port->callbacks >= 8)
         port->max_callback_frames = std::max(port->max_callback_frames, static_cast<uint32_t>(nframes));
     const uint64_t callback_us = static_cast<uint64_t>(nframes) * 1000000 / std::max<uint32_t>(port->spec.rate, 1);
@@ -149,19 +149,23 @@ AudioOutPortPtr CubebAudioAdapter::open_port(int nb_channels, int freq, int nb_s
     const uint32_t sample_count = static_cast<uint32_t>(nb_sample);
     const uint32_t min_queue_frames = static_cast<uint32_t>(freq) * AUDIO_MIN_QUEUE_MS / 1000;
     const uint32_t threshold = std::max(3 * latency, min_queue_frames);
-    const int nb_buffers = static_cast<int>((2 * threshold + sample_count - 1) / sample_count) + 1;
+    // Fast forward stores resampled chunks up to MAX_FAST_FORWARD times shorter
+    // than len_bytes, so keep enough slots to hold the same audio duration.
+    constexpr int max_fast_forward = 4;
+    const int nb_buffers = ((static_cast<int>((2 * threshold + sample_count - 1) / sample_count) + 1) * max_fast_forward);
     port->audio_buffers.resize(nb_buffers);
     for (AudioBuffer &audio_buffer : port->audio_buffers) {
         // initialize all the buffers
         audio_buffer.buffer.resize(port->len_bytes);
         audio_buffer.buffer_position = 0;
+        audio_buffer.valid_bytes = 0;
     }
 
     cubeb_stream_start(port->out_stream);
     return port;
 }
 
-void CubebAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer) {
+void CubebAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer, int bytes) {
     CubebAudioOutPort &port = static_cast<CubebAudioOutPort &>(out_port);
 
     std::unique_lock<std::mutex> lock(port.mutex);
@@ -188,11 +192,16 @@ void CubebAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer)
     assert(port.nb_buffers_ready < port.audio_buffers.size());
     if (buffer) {
         // the buffer can be empty to drain the port
-        int next_buffer_pos = (port.next_audio_buffer + port.nb_buffers_ready) % port.audio_buffers.size();
-        // we could unlock the lock here and re-lock it right after, but will this be faster?
-        memcpy(port.audio_buffers[next_buffer_pos].buffer.data(), buffer, port.len_bytes);
-        port.audio_buffers[next_buffer_pos].buffer_position = 0;
-        port.nb_buffers_ready++;
+        const int valid_bytes = std::clamp(bytes, 0, port.len_bytes);
+        if (valid_bytes > 0) {
+            int next_buffer_pos = (port.next_audio_buffer + port.nb_buffers_ready) % port.audio_buffers.size();
+            // we could unlock the lock here and re-lock it right after, but will this be faster?
+            memcpy(port.audio_buffers[next_buffer_pos].buffer.data(), buffer, valid_bytes);
+            port.audio_buffers[next_buffer_pos].buffer_position = 0;
+            port.audio_buffers[next_buffer_pos].valid_bytes = valid_bytes;
+            port.queued_bytes += valid_bytes;
+            port.nb_buffers_ready++;
+        }
     }
 
     lock.unlock();

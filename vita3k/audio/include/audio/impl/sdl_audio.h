@@ -42,7 +42,7 @@ public:
     bool init() override;
     void switch_state(const bool pause) override;
     AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) override;
-    void audio_output(AudioOutPort &out_port, const void *buffer) override;
+    void audio_output(AudioOutPort &out_port, const void *buffer, int bytes) override;
     void set_volume(AudioOutPort &out_port, float volume) override;
     int get_rest_sample(AudioOutPort &out_port) override;
     void wake_all_ports() override;

@@ -39,6 +39,10 @@ data class OverlayConfig(
     @JvmField
     val hideOverlayTimeSeconds: Int = 10,
 
+    // Multiplier used when the fast forward tool key is latched on (2x - 4x).
+    @JvmField
+    val fastForwardSpeed: Int = 3,
+
     @JvmField
     val touchSwitchTilt: Boolean = false
 ) {
@@ -56,6 +60,9 @@ data class OverlayConfig(
 
     val hideToggleVisible: Boolean
         get() = overlayMask and InputOverlay.OVERLAY_MASK_HIDE_TOGGLE != 0
+
+    val fastForwardVisible: Boolean
+        get() = overlayMask and InputOverlay.OVERLAY_MASK_FAST_FORWARD != 0
 
     fun activeMask(): Int = if (overlayMask == 0) DEFAULT_OVERLAY_MASK else overlayMask
 
@@ -131,6 +138,16 @@ data class OverlayConfig(
         return copy(overlayMask = updatedMask).normalized()
     }
 
+    fun withFastForwardVisible(visible: Boolean): OverlayConfig {
+        val baseMask = activeMask()
+        val updatedMask = if (visible) {
+            baseMask or InputOverlay.OVERLAY_MASK_FAST_FORWARD
+        } else {
+            baseMask and InputOverlay.OVERLAY_MASK_FAST_FORWARD.inv()
+        }
+        return copy(overlayMask = updatedMask).normalized()
+    }
+
     // ---- 新增:每个按钮独立开关(跟上面的组开关并存,取交集判断) ----
 
     fun isButtonVisible(legacyId: Int): Boolean =
@@ -147,7 +164,8 @@ data class OverlayConfig(
             InputOverlay.OVERLAY_MASK_L2R2 or
             InputOverlay.OVERLAY_MASK_L3R3 or
             InputOverlay.OVERLAY_MASK_TOUCH_SCREEN_SWITCH or
-            InputOverlay.OVERLAY_MASK_HIDE_TOGGLE
+            InputOverlay.OVERLAY_MASK_HIDE_TOGGLE or
+            InputOverlay.OVERLAY_MASK_FAST_FORWARD
         val sanitizedMask = overlayMask.coerceAtLeast(0) and knownMask
 
         // The touch switch and hide toggle have dedicated visibility toggles (group mask
@@ -155,6 +173,7 @@ data class OverlayConfig(
         // fully controls the utility button (no second, redundant switch needed).
         val touchSwitchBit = OverlayButtonRegistry.bitFor(ButtonType.BUTTON_TOUCH_SWITCH)
         val hideToggleBit = OverlayButtonRegistry.bitFor(ButtonType.BUTTON_TOUCH_HIDE)
+        val fastForwardBit = OverlayButtonRegistry.bitFor(ButtonType.BUTTON_FAST_FORWARD)
         var buttons = visibleButtons
         buttons = if (sanitizedMask and InputOverlay.OVERLAY_MASK_TOUCH_SCREEN_SWITCH != 0)
             buttons or touchSwitchBit
@@ -164,6 +183,10 @@ data class OverlayConfig(
             buttons or hideToggleBit
         else
             buttons and hideToggleBit.inv()
+        buttons = if (sanitizedMask and InputOverlay.OVERLAY_MASK_FAST_FORWARD != 0)
+            buttons or fastForwardBit
+        else
+            buttons and fastForwardBit.inv()
 
         return copy(
             overlayMask = sanitizedMask,
@@ -172,6 +195,7 @@ data class OverlayConfig(
             overlayOpacityPortrait = overlayOpacityPortrait.coerceIn(20, 100),
             overlayOpacityLandscape = overlayOpacityLandscape.coerceIn(20, 100),
             hideOverlayTimeSeconds = hideOverlayTimeSeconds.coerceIn(0, 300),
+            fastForwardSpeed = fastForwardSpeed.coerceIn(2, 4),
             buttonSlideMode = buttonSlideMode.coerceIn(SLIDE_OFF, SLIDE_TRANSFER)
         )
     }

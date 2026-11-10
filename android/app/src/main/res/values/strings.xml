@@ -545,6 +545,11 @@
     <string name="settings_controls_touch_switch_tilt_desc">Add a T step to the touchscreen switch, after F, B and F+B. In that step, touching the screen tilts the console towards your finger instead of touching it, for games that need the motion sensor. It only works when neither this device nor the controller has a gyroscope.</string>
     <string name="settings_controls_hide_toggle">Show Hide Toggle</string>
     <string name="settings_controls_hide_toggle_desc">Show the button that temporarily hides the on-screen controls.</string>
+    <string name="settings_controls_fast_forward">Show Fast Forward</string>
+    <string name="settings_controls_fast_forward_desc">Show the button that toggles fast forward. Tap it once to speed up emulation, tap it again to return to normal speed.</string>
+    <string name="settings_controls_fast_forward_speed">Fast Forward Speed</string>
+    <string name="settings_controls_fast_forward_speed_desc">How many times faster the emulator runs while fast forward is on. Audio speeds up with the game, so its pitch rises.</string>
+    <string name="settings_controls_fast_forward_speed_value">%1$dx</string>
     <string name="settings_controls_scale">Overlay Scale</string>
     <string name="settings_controls_scale_desc">Resize the touch controls to better fit your hands and screen.</string>
     <string name="settings_controls_opacity">Overlay Opacity</string>

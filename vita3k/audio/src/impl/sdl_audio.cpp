@@ -132,8 +132,12 @@ AudioOutPortPtr SDLAudioAdapter::open_port(int nb_channels, int freq, int nb_sam
     return port;
 }
 
-void SDLAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer) {
+void SDLAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer, int bytes) {
     if (out_port.stopping)
+        return;
+
+    const int valid_bytes = std::clamp(bytes, 0, out_port.len_bytes);
+    if (!buffer || valid_bytes <= 0)
         return;
 
     //  Put audio to the port's stream and see how much is left to play.
@@ -170,7 +174,7 @@ void SDLAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer) {
         if (out_port.stopping)
             return;
     }
-    SDL_CHECK_VOID(SDL_PutAudioStreamData(port.stream.get(), buffer, out_port.len_bytes));
+    SDL_CHECK_VOID(SDL_PutAudioStreamData(port.stream.get(), buffer, valid_bytes));
 }
 
 void SDLAudioAdapter::set_volume(AudioOutPort &out_port, float volume) {

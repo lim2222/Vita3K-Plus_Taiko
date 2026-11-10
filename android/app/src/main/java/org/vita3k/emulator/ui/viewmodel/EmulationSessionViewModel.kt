@@ -38,6 +38,7 @@ data class EmulationSessionUiState(
     val hapticAmplitude: Int = 255,
     val buttonSlideMode: Int = OverlayConfig.SLIDE_TRANSFER,
     val hideOverlayTimeSeconds: Int = 10,
+    val fastForwardSpeed: Int = 3,
     val touchSwitchTilt: Boolean = false,
     val controllerConnected: Boolean = false,
     val statusMessage: String? = null,
@@ -364,6 +365,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             hapticAmplitude = uiState.hapticAmplitude,
             buttonSlideMode = uiState.buttonSlideMode,
             hideOverlayTimeSeconds = uiState.hideOverlayTimeSeconds,
+            fastForwardSpeed = uiState.fastForwardSpeed,
             touchSwitchTilt = uiState.touchSwitchTilt
         ).normalized()
     }
@@ -472,6 +474,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             hapticAmplitude = normalized.hapticAmplitude,
             buttonSlideMode = normalized.buttonSlideMode,
             hideOverlayTimeSeconds = normalized.hideOverlayTimeSeconds,
+            fastForwardSpeed = normalized.fastForwardSpeed,
             touchSwitchTilt = normalized.touchSwitchTilt
         )
     }

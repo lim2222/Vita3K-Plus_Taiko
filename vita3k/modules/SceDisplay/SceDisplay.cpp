@@ -26,6 +26,8 @@
 #include <util/lock_and_find.h>
 #include <util/types.h>
 
+#include <chrono>
+
 #include <util/tracy.h>
 TRACY_MODULE_NAME(SceDisplay);
 
@@ -157,6 +159,11 @@ EXPORT(SceInt32, _sceDisplaySetFrameBuf, const SceDisplayFrameBuf *pFrameBuf, Sc
     update_prediction(emuenv, info);
 
     emuenv.display.last_setframe_vblank_count = emuenv.display.vblank_count.load();
+    emuenv.display.last_setframe_host_us.store(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+                                  .count()),
+        std::memory_order_relaxed);
     emuenv.frame_count++;
 
     const uint64_t nflip = emuenv.display.setframe_accept_count.fetch_add(1, std::memory_order_relaxed) + 1;

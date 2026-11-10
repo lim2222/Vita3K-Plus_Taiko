@@ -21,14 +21,37 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_joystick.h>
 #include <SDL3/SDL_log.h>
+#include <audio/state.h>
+#include <config/state.h>
 #include <ctrl/functions.h>
+#include <display/state.h>
 #include <jni.h>
+#include <renderer/state.h>
+#include <rtc/rtc.h>
 #include <touch/functions.h>
 
+#include <algorithm>
 #include <string>
 
 static int virtual_joystick_id = -1;
 static SDL_Joystick *virtual_joystick = nullptr;
+
+// Pushes the fast forward state into the emulator. The vblank thread is the
+// source of truth: every tick it applies the effective speed to the guest clock
+// and the audio producer, and shortens the vblank period. This function only
+// requests a speed (and drops vsync so presenting does not cap it).
+static void apply_fast_forward(EmuEnvState &emuenv, const bool enable, const int speed) {
+    const int multiplier = enable ? std::clamp(speed, 2, 4) : 1;
+    emuenv.display.fast_forward_speed.store(multiplier, std::memory_order_relaxed);
+    if (multiplier == 1) {
+        // Make disabling immediate instead of waiting for the next vblank (the
+        // controller can also be detached while the emulator is paused).
+        emuenv.audio.fast_forward_speed.store(1, std::memory_order_relaxed);
+        rtc_set_time_scale(1);
+    }
+    if (emuenv.renderer)
+        emuenv.renderer->set_vsync_state(multiplier == 1 ? emuenv.cfg.current_config.v_sync : false);
+}
 
 static void refresh_overlay_controllers() {
     auto *emuenv = get_emuenv();
@@ -46,6 +69,10 @@ void detach_overlay_virtual_controller() {
         SDL_DetachVirtualJoystick(virtual_joystick_id);
     virtual_joystick = nullptr;
     virtual_joystick_id = -1;
+    // The overlay is going away (session end, controller connected, app to the
+    // background), so never leave the emulator running at a multiplier.
+    if (auto *emuenv = get_emuenv())
+        apply_fast_forward(*emuenv, false, 1);
     refresh_overlay_controllers();
 }
 
@@ -108,6 +135,15 @@ Java_org_vita3k_emulator_overlay_InputOverlay_setButton(JNIEnv *env, jobject thi
         SDL_SetJoystickVirtualAxis(virtual_joystick, -button, value ? SDL_MAX_SINT16 : 0);
     else
         SDL_SetJoystickVirtualButton(virtual_joystick, button, value);
+}
+
+JNIEXPORT void JNICALL
+Java_org_vita3k_emulator_overlay_InputOverlay_setFastForward(JNIEnv *env, jobject thiz, jboolean enable, jint speed) {
+    auto *emuenv = get_emuenv();
+    if (!emuenv)
+        return;
+
+    apply_fast_forward(*emuenv, enable != JNI_FALSE, static_cast<int>(speed));
 }
 
 JNIEXPORT void JNICALL

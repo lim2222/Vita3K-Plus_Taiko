@@ -33,6 +33,7 @@
 #endif
 #include <display/functions.h>
 
+#include <audio/state.h>
 #include <cheat/functions.h>
 #include <config/state.h>
 #include <ctrl/functions.h>
@@ -47,6 +48,7 @@
 #include <mem/functions.h>
 #include <mem/ptr.h>
 #include <renderer/state.h>
+#include <rtc/rtc.h>
 
 #include <chrono>
 #include <motion/functions.h>
@@ -155,6 +157,36 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
     };
 
     while (!display.abort.load()) {
+        const auto frame_start = std::chrono::steady_clock::now();
+        // Fast forward shortens the vblank period by this multiplier. While the
+        // guest is paused nothing advances anyway, so keep the idle UI refresh
+        // (vblank callbacks, cheat re-apply, menu presents) at the normal rate.
+        const int requested_speed = emuenv.kernel.is_threads_paused()
+            ? 1
+            : std::max(1, display.fast_forward_speed.load(std::memory_order_relaxed));
+        int emulation_speed = requested_speed;
+        if (requested_speed > 1) {
+            // A game that has not flipped a frame for a while is loading or
+            // otherwise not presenting; fast forward cannot help an IO/CPU
+            // bound load and scaling guest time there only disturbs its
+            // event-flag handshakes. Suspend FF until frames come back.
+            constexpr uint64_t FF_STALL_US = 1'000'000;
+            const uint64_t now_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(frame_start.time_since_epoch()).count());
+            const uint64_t last_flip_us = display.last_setframe_host_us.load(std::memory_order_relaxed);
+            if (last_flip_us == 0 || now_us < last_flip_us || now_us - last_flip_us > FF_STALL_US)
+                emulation_speed = 1;
+        }
+        // The guest clock and the audio producer must advance at the same
+        // effective speed as this thread, otherwise time-based waits and audio
+        // drift apart as soon as fast forward is used.
+        static int last_logged_speed = 1;
+        if (emulation_speed != last_logged_speed) {
+            LOG_INFO("[FF] effective speed {}x (requested {}x)", emulation_speed, requested_speed);
+            last_logged_speed = emulation_speed;
+        }
+        emuenv.audio.fast_forward_speed.store(emulation_speed, std::memory_order_relaxed);
+        rtc_set_time_scale(emulation_speed);
         std::vector<ThreadStatePtr> vblank_ready;
         bool has_frame = false;
         {
@@ -219,7 +251,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
         if (emuenv.cfg.hang_dump_seconds > 0) {
             static uint64_t next_forced_dump_vblank = 0;
             const uint64_t vblanks_now = emuenv.display.vblank_count.load();
-            const uint64_t period = static_cast<uint64_t>(emuenv.cfg.hang_dump_seconds) * 60;
+            const uint64_t period = static_cast<uint64_t>(emuenv.cfg.hang_dump_seconds) * 60 * static_cast<uint64_t>(emulation_speed);
             if (period > 0 && vblanks_now >= next_forced_dump_vblank && !emuenv.kernel.is_threads_paused()) {
                 next_forced_dump_vblank = vblanks_now + period;
                 LOG_ERROR("PERIODIC THREAD DUMP (hang-dump-seconds={}) — vblank {}", emuenv.cfg.hang_dump_seconds, vblanks_now);
@@ -237,6 +269,10 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
 
         // Hang watchdog - if there's no framebuffer flip for ~10s (600 vblanks) while unpaused then dump guest threads
         {
+            // All the windows below are expressed in vblanks, so they must be
+            // widened by the fast forward multiplier or a normal load would look
+            // like a hang (600 vblanks is 10 s at 60 Hz but 2.5 s at 240 Hz).
+            const uint64_t wd_scale = static_cast<uint64_t>(emulation_speed);
             static uint64_t last_dumped_setframe = ~0ull;
             static uint64_t last_break_vblanks = 0;
             static uint64_t last_provable_break_setframe = ~0ull;
@@ -321,7 +357,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
             const uint64_t renderer_idle_vblanks = vblanks - last_progress_change_vblank;
             const uint64_t guest_idle_vblanks = vblanks - last_wake_change_vblank;
-            constexpr uint64_t THREAD_CREATE_QUIET_VBLANKS = 300; // ~5s
+            const uint64_t THREAD_CREATE_QUIET_VBLANKS = 300 * wd_scale; // ~5s
             const uint64_t creates_now = emuenv.kernel.thread_create_counter.load(std::memory_order_relaxed);
             if (creates_now != last_create_value) {
                 last_create_value = creates_now;
@@ -339,7 +375,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                     emuenv.renderer ? emuenv.renderer->progress_counter.load(std::memory_order_relaxed) : 0);
 
             // Full 10s dump for diagnostics (once per distinct stall).
-            if (stall_vblanks > 600 && unpaused && last_dumped_setframe != setframe) {
+            if (stall_vblanks > 600 * wd_scale && unpaused && last_dumped_setframe != setframe) {
                 last_dumped_setframe = setframe; // one dump per distinct stall
                 LOG_ERROR("HANG WATCHDOG: no framebuffer flip for {} vblanks{} (renderer idle {}, guest wake-idle {}, SetFrameBuf calls={} accepted={}) — dumping guest threads",
                     stall_vblanks, never_flipped ? " (game NEVER flipped since boot)" : "", renderer_idle_vblanks, guest_idle_vblanks,
@@ -350,7 +386,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                     emuenv.gxm.display_queue.size(), emuenv.gxm.display_worker_state.load(), emuenv.gxm.display_entries_done.load());
                 emuenv.kernel.log_eventflag_history();
             }
-            if (never_flipped && stall_vblanks > 3600 && unpaused && !never_flip_redumped) {
+            if (never_flipped && stall_vblanks > 3600 * wd_scale && unpaused && !never_flip_redumped) {
                 never_flip_redumped = true;
                 LOG_ERROR("HANG WATCHDOG: STILL no first flip after {} vblanks (SetFrameBuf calls={}) — re-dumping for movement comparison",
                     stall_vblanks, emuenv.display.setframe_call_count.load());
@@ -360,8 +396,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 emuenv.kernel.log_eventflag_history();
             }
             constexpr uint32_t STUCK_SCENE_MAX_PIPELINES = 32;
-            constexpr uint64_t STUCK_SCENE_FROZEN_VBLANKS = 720;
-            constexpr uint64_t STUCK_SCENE_REDUMP_VBLANKS = 600;
+            const uint64_t STUCK_SCENE_FROZEN_VBLANKS = 720 * wd_scale;
+            const uint64_t STUCK_SCENE_REDUMP_VBLANKS = 600 * wd_scale;
             constexpr int STUCK_SCENE_MAX_DUMPS = 3;
             constexpr uint64_t STUCK_SCENE_PRESENTING_VBLANKS = 120;
             const uint32_t pipes_now = emuenv.renderer ? emuenv.renderer->diag_pipelines_created() : ~0u;
@@ -402,7 +438,7 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
                 last_stuck_scene_dump_vblank = vblanks;
                 ++stuck_scene_dumps;
                 LOG_ERROR("STUCK-SCENE WATCHDOG (dump {}/{}): presenting ({} SetFrameBuf accepted, last flip {} vblanks ago) but only {} pipeline(s) ever compiled, frozen for {} vblanks (~{}s), and nothing has read input for {} vblanks or touched a file for {} vblanks — game logic stalled; dumping guest threads",
-                    stuck_scene_dumps, STUCK_SCENE_MAX_DUMPS, emuenv.display.setframe_accept_count.load(), stall_vblanks, pipes_now, pipes_frozen_vblanks, pipes_frozen_vblanks / 60, input_idle_vblanks, io_idle_vblanks);
+                    stuck_scene_dumps, STUCK_SCENE_MAX_DUMPS, emuenv.display.setframe_accept_count.load(), stall_vblanks, pipes_now, pipes_frozen_vblanks, pipes_frozen_vblanks / (60 * wd_scale), input_idle_vblanks, io_idle_vblanks);
                 emuenv.kernel.log_thread_hang_dump();
                 renderer_heartbeat();
                 if (stuck_scene_dumps == 1) {
@@ -413,12 +449,12 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
 
             // still flipping (loading spinner) but the renderer has processed nothing for 15 s
-            if (!never_flipped && unpaused && renderer_idle_vblanks >= 900 && idle_render_dumps < 3
-                && (idle_render_dumps == 0 || vblanks - last_idle_render_dump_vblank >= 1800)) {
+            if (!never_flipped && unpaused && renderer_idle_vblanks >= 900 * wd_scale && idle_render_dumps < 3
+                && (idle_render_dumps == 0 || vblanks - last_idle_render_dump_vblank >= 1800 * wd_scale)) {
                 last_idle_render_dump_vblank = vblanks;
                 ++idle_render_dumps;
                 LOG_ERROR("IDLE-RENDER WATCHDOG (dump {}/3): still flipping (SetFrameBuf accepted={}) but the renderer processed nothing for {} vblanks (~{}s); guest wake-idle {} vblanks - dumping guest threads",
-                    idle_render_dumps, emuenv.display.setframe_accept_count.load(), renderer_idle_vblanks, renderer_idle_vblanks / 60, guest_idle_vblanks);
+                    idle_render_dumps, emuenv.display.setframe_accept_count.load(), renderer_idle_vblanks, renderer_idle_vblanks / (60 * wd_scale), guest_idle_vblanks);
                 emuenv.kernel.log_thread_hang_dump();
                 renderer_heartbeat();
                 LOG_ERROR("IDLE-RENDER DISPLAY QUEUE: depth={} worker_state={} entries_done={}",
@@ -426,9 +462,9 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
 
             // Cycle breaker
-            constexpr uint64_t PROVABLE_DRYRUN_VBLANKS = 120;
-            constexpr uint64_t PROVABLE_BREAK_VBLANKS = 300;
-            constexpr uint64_t PROVABLE_RECOVERY_VBLANKS = 600;
+            const uint64_t PROVABLE_DRYRUN_VBLANKS = 120 * wd_scale;
+            const uint64_t PROVABLE_BREAK_VBLANKS = 300 * wd_scale;
+            const uint64_t PROVABLE_RECOVERY_VBLANKS = 600 * wd_scale;
             constexpr uint64_t FLIP_STREAK_MAX_GAP_VBLANKS = 30;
             const int64_t now_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
             const bool world_stop_quiet = (now_epoch_ms - emuenv.kernel.last_world_stop_epoch_ms.load(std::memory_order_relaxed)) >= 5000;
@@ -474,8 +510,8 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
 
             // Deadlock breaker for stuck event flags
-            constexpr uint64_t BREAK_STALL_VBLANKS = 300; // ~5s at 60Hz
-            constexpr uint64_t BREAK_SLOW_VBLANKS = 900; // ~15s fallback when guest threads still wake
+            const uint64_t BREAK_STALL_VBLANKS = 300 * wd_scale; // ~5s at 60Hz
+            const uint64_t BREAK_SLOW_VBLANKS = 900 * wd_scale; // ~15s fallback when guest threads still wake
             if (!never_flipped && stall_vblanks > BREAK_STALL_VBLANKS && unpaused
                 && (last_break_vblanks == 0 || vblanks - last_break_vblanks > BREAK_STALL_VBLANKS)) {
                 last_break_vblanks = vblanks;
@@ -526,25 +562,34 @@ static void vblank_sync_thread(EmuEnvState &emuenv) {
             }
         }
 
-        const auto time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto time_left = VBLANK_PERIOD_NS - (time_ns % VBLANK_PERIOD_NS);
+        // Pace the next vblank. The deadline advances by exactly one period, so
+        // the long-term rate is exact at any speed, but when an iteration
+        // overruns the deadline (slow frame) we realign instead of sleeping
+        // through the next slot and then bursting vblanks to catch up.
+        static auto next_vblank_deadline = std::chrono::steady_clock::now();
+        const auto vblank_period = std::chrono::nanoseconds(VBLANK_PERIOD_NS / emulation_speed);
+        next_vblank_deadline += vblank_period;
+        if (next_vblank_deadline < frame_start)
+            next_vblank_deadline = frame_start;
         if (display.fps_hack) {
-            if (time_left > VBLANK_PERIOD_NS / 2) {
-                std::this_thread::sleep_for(std::chrono::nanoseconds(time_left - VBLANK_PERIOD_NS / 2));
+            const auto half_deadline = frame_start + (next_vblank_deadline - frame_start) / 2;
+            if (std::chrono::steady_clock::now() < half_deadline) {
+                std::this_thread::sleep_until(half_deadline);
                 wake_half_vblank_waiters(display);
             }
-            const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-            if (time_ns + time_left > now_ns)
-                std::this_thread::sleep_for(std::chrono::nanoseconds(time_ns + time_left - now_ns));
-        } else {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(time_left));
         }
+        if (std::chrono::steady_clock::now() < next_vblank_deadline)
+            std::this_thread::sleep_until(next_vblank_deadline);
     }
 
     watchdog.join();
 }
 
 void start_sync_thread(EmuEnvState &emuenv) {
+    // Never inherit a latched fast forward speed (or a stale flip timestamp)
+    // from the previous game: the overlay latch is per session.
+    emuenv.display.fast_forward_speed.store(1, std::memory_order_relaxed);
+    emuenv.display.last_setframe_host_us.store(0, std::memory_order_relaxed);
     emuenv.display.vblank_thread = std::make_unique<std::thread>(vblank_sync_thread, std::ref(emuenv));
 }
 
@@ -714,8 +759,11 @@ void DisplayState::deinit() {
 
     vblank_count = 0;
     last_setframe_vblank_count = 0;
+    last_setframe_host_us = 0;
     setframe_call_count = 0;
     setframe_accept_count = 0;
+    fast_forward_speed = 1;
+    rtc_set_time_scale(1);
 
     fps_hack = false;
     // pretty sure we set this on game boot

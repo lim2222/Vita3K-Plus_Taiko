@@ -22,10 +22,17 @@
 
 #include <util/log.h>
 
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
 bool AudioState::init(const std::string &adapter_name) {
+    // A session can end while fast forward is latched; never start the next game
+    // with a stale multiplier before the display thread publishes its own.
+    fast_forward_speed.store(1, std::memory_order_relaxed);
+
     set_backend(adapter_name);
     if (!adapter)
         return false;
@@ -100,7 +107,45 @@ void AudioState::audio_output(AudioOutPort &out_port, const void *buffer) {
     if (out_port.stopping)
         return;
 
-    adapter->audio_output(out_port, buffer);
+    const int speed = std::clamp(fast_forward_speed.load(std::memory_order_relaxed), 1, 8);
+    if (!buffer || speed <= 1 || out_port.len_bytes <= 0) {
+        adapter->audio_output(out_port, buffer, out_port.len_bytes);
+        return;
+    }
+
+    // Fast forward: compress the guest chunk so the host queue drains `speed`
+    // times faster. The guest sound thread is paced by that queue, so it
+    // advances at the same rate as the scaled guest clock. Linear interpolation
+    // keeps the stream continuous; the pitch rises, which is the usual
+    // fast-forward sound and avoids adding a time-stretching dependency.
+    constexpr int sample_bytes = static_cast<int>(sizeof(int16_t));
+    const int channels = (out_port.len > 0)
+        ? std::clamp(out_port.len_bytes / (out_port.len * sample_bytes), 1, 2)
+        : 2;
+    const int frame_bytes = channels * sample_bytes;
+    const int in_frames = out_port.len_bytes / frame_bytes;
+    if (in_frames <= 1) {
+        adapter->audio_output(out_port, buffer, out_port.len_bytes);
+        return;
+    }
+
+    const int out_frames = std::max(1, in_frames / speed);
+    std::vector<int16_t> resampled(static_cast<size_t>(out_frames) * channels);
+    const int16_t *in = static_cast<const int16_t *>(buffer);
+    const double step = static_cast<double>(in_frames) / static_cast<double>(out_frames);
+    for (int i = 0; i < out_frames; i++) {
+        const double position = i * step;
+        const int first = std::min(static_cast<int>(position), in_frames - 1);
+        const int second = std::min(first + 1, in_frames - 1);
+        const float frac = static_cast<float>(position - first);
+        for (int c = 0; c < channels; c++) {
+            const float a = in[first * channels + c];
+            const float b = in[second * channels + c];
+            resampled[static_cast<size_t>(i) * channels + c] = static_cast<int16_t>(a + (b - a) * frac);
+        }
+    }
+
+    adapter->audio_output(out_port, resampled.data(), static_cast<int>(resampled.size() * sizeof(int16_t)));
 }
 
 void AudioState::set_volume(AudioOutPort &out_port, float volume) {
@@ -122,7 +167,12 @@ void AudioState::switch_state(const bool pause) {
 }
 
 int AudioState::get_rest_sample(AudioOutPort &out_port) {
-    return adapter->get_rest_sample(out_port);
+    const int rest = adapter->get_rest_sample(out_port);
+    // Fast forward compresses every queued guest chunk, so one host frame left
+    // in the queue still spans `speed` guest samples. Report guest units, which
+    // is what the caller asks for.
+    const int speed = std::clamp(fast_forward_speed.load(std::memory_order_relaxed), 1, 8);
+    return speed > 1 ? rest * speed : rest;
 }
 
 void AudioState::wake_all_ports() {

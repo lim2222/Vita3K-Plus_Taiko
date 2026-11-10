@@ -107,8 +107,18 @@ void rtc_set_clock_paused(bool paused);
 // closed while paused does not leak into the new game.
 void rtc_reset_clock_state();
 
+// Scale the guest-visible clock relative to wall time. 1 = normal speed, 2..8
+// = fast forward. The clock stays monotonic when the scale changes; pause
+// bookkeeping is preserved.
+void rtc_set_time_scale(int scale);
+
+// Current guest clock multiplier (1 when not fast forwarding). Callers that
+// convert a remaining guest duration into a host wait time must divide by it.
+int rtc_get_time_scale();
+
 // Freeze-aware host clock in Vita microseconds (VITA_CLOCKS_PER_SEC units).
 // While paused this stops advancing; on resume it continues without a jump.
+// During fast forward it advances at the scale set by rtc_set_time_scale().
 std::uint64_t rtc_guest_clock_ticks();
 
 // True while the guest clock is frozen by an active emulator pause. Timed guest
