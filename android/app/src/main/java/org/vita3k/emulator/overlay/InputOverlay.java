@@ -74,6 +74,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   private final Set<InputOverlayDrawableDpad> overlayDpads = new HashSet<>();
   private final Set<InputOverlayDrawableJoystick> overlayJoysticks = new HashSet<>();
   private final Set<InputOverlayDrawableTatacon> overlayTatacons = new HashSet<>();
+  // Pointers that went down inside the drum; they are consumed by the overlay even
+  // when the touched zone is already held, so they never reach the front touchscreen.
+  private final Set<Integer> mTataconPointers = new HashSet<>();
   private final Runnable mHideOverlayTicker = new Runnable() {
     @Override
     public void run() {
@@ -329,11 +332,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     }
 
     for (InputOverlayDrawableTatacon tatacon : overlayTatacons) {
-      if (tatacon.getActiveZone() != InputOverlayDrawableTatacon.ZONE_NONE)
-        setButton(tatacon.getControl(tatacon.getActiveZone()), false);
-      tatacon.setActiveZone(InputOverlayDrawableTatacon.ZONE_NONE);
-      tatacon.setTrackId(-1);
+      releaseAllTataconZones(tatacon);
     }
+    mTataconPointers.clear();
 
     invalidate();
   }
@@ -389,6 +390,13 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
         released = true;
       }
     }
+    for (InputOverlayDrawableTatacon tatacon : overlayTatacons)
+    {
+      if (pointerId == -1)
+        released |= releaseAllTataconZones(tatacon);
+      else
+        released |= releaseTataconPointer(tatacon, pointerId);
+    }
     if (released)
       invalidate();
   }
@@ -426,6 +434,13 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
           released = true;
         }
       }
+    }
+    for (InputOverlayDrawableTatacon tatacon : overlayTatacons)
+    {
+      final boolean active = processing && !mHideOverlayButtons
+              && mOverlayConfig != null && mOverlayConfig.isButtonVisible(tatacon.getLegacyId());
+      if (!active && releaseAllTataconZones(tatacon))
+        released = true;
     }
     if (released)
       invalidate();
@@ -500,7 +515,10 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       return false;
     }
     if (actionMasked == MotionEvent.ACTION_DOWN)
+    {
       releaseTrackedInputs(-1);
+      mTataconPointers.clear();
+    }
     else if (actionMasked == MotionEvent.ACTION_POINTER_DOWN)
       releaseTrackedInputs(event.getPointerId(event.getActionIndex()));
 
@@ -669,6 +687,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
     for (InputOverlayDrawableTatacon tatacon : overlayTatacons)
     {
+      if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_POINTER_UP)
+        mTataconPointers.remove(event.getPointerId(event.getActionIndex()));
+
       // When the overlay is hidden via the hide toggle, the tatacon must be disabled
       // too (not just hidden visually), matching every other control.
       if (mHideOverlayButtons) continue;
@@ -677,44 +698,23 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       switch (action)
       {
         case MotionEvent.ACTION_DOWN:
-	case MotionEvent.ACTION_POINTER_DOWN:
-	  if (tatacon.getBounds().contains((int) event.getX(pointerIndex), (int) event.getY(pointerIndex))
-		  && !isPointerOwnedByButtonDpadOrJoystick(event.getPointerId(pointerIndex)))
-	  {
-		tatacon.setTrackId(event.getPointerId(pointerIndex));
-		concerned = true;
-	  }
-        // 贯穿到 MOVE
-	case MotionEvent.ACTION_MOVE:
-	  if (tatacon.getTrackId() == event.getPointerId(pointerIndex))
-	  {
+        case MotionEvent.ACTION_POINTER_DOWN:
+          if (pressTataconAtPointer(tatacon, event, pointerIndex))
             concerned = true;
-            int zone = InputOverlayDrawableTatacon.zoneForTouch(tatacon.getBounds(),
-                    event.getX(pointerIndex), event.getY(pointerIndex));
-            int prevZone = tatacon.getActiveZone();
-            if (zone != prevZone)
-            {
-              if (prevZone != InputOverlayDrawableTatacon.ZONE_NONE)
-                setButton(tatacon.getControl(prevZone), false);
-              if (zone != InputOverlayDrawableTatacon.ZONE_NONE)
-              {
-                setButton(tatacon.getControl(zone), true);
-                triggerTataconHapticFeedback(zone, event.getEventTime()); // Taiko drum hit
-              }
-              tatacon.setActiveZone(zone);
-            }
-          }
           break;
+
+        case MotionEvent.ACTION_MOVE:
+          // Every finger owns its own zone now, so all pointers have to be updated;
+          // the tracked finger is not necessarily pointer index 0.
+          for (int i = 0; i < event.getPointerCount(); i++)
+            if (moveTataconPointer(tatacon, event, i))
+              concerned = true;
+          break;
+
         case MotionEvent.ACTION_UP:
         case MotionEvent.ACTION_POINTER_UP:
-          if (tatacon.getTrackId() == event.getPointerId(pointerIndex))
-          {
+          if (releaseTataconPointer(tatacon, event.getPointerId(event.getActionIndex())))
             concerned = true;
-            if (tatacon.getActiveZone() != InputOverlayDrawableTatacon.ZONE_NONE)
-              setButton(tatacon.getControl(tatacon.getActiveZone()), false);
-            tatacon.setActiveZone(InputOverlayDrawableTatacon.ZONE_NONE);
-            tatacon.setTrackId(-1);
-          }
           break;
       }
     }
@@ -836,6 +836,98 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       amplitude = strength;
     }
     vib.vibrate(VibrationEffect.createOneShot(duration, amplitude));
+  }
+
+  /**
+   * Claims the drum zone under this pointer and presses it. The zone stays pressed
+   * until that finger lifts, so two fingers on opposite sides are held at the same
+   * time and the game can actually see a big note.
+   */
+  private boolean pressTataconAtPointer(InputOverlayDrawableTatacon tatacon, MotionEvent event,
+          int pointerIndex)
+  {
+    final int pointerId = event.getPointerId(pointerIndex);
+    if (tatacon.isTracked(pointerId))
+      return false;
+    if (isPointerOwnedByButtonDpadOrJoystick(pointerId))
+      return false;
+    if (!tatacon.getBounds().contains((int) event.getX(pointerIndex), (int) event.getY(pointerIndex)))
+      return false;
+
+    final int zone = InputOverlayDrawableTatacon.zoneForTouch(tatacon.getBounds(),
+            event.getX(pointerIndex), event.getY(pointerIndex));
+    if (zone == InputOverlayDrawableTatacon.ZONE_NONE)
+      return false;
+
+    // The drum consumes every pointer on a zone, even if that zone is already held by
+    // another finger, so it never leaks to the front touchscreen (Azahar behaviour).
+    mTataconPointers.add(pointerId);
+
+    // Zone already held by another finger: swallow this touch.
+    if (tatacon.getTrackId(zone) != -1)
+      return false;
+
+    tatacon.setTrackId(zone, pointerId);
+    tatacon.setPressedState(zone, true);
+    setButton(tatacon.getControl(zone), true);
+    triggerTataconHapticFeedback(zone, event.getEventTime()); // Taiko drum hit
+    return true;
+  }
+
+  /** Slides a finger that already owns a zone to the zone under its current position. */
+  private boolean moveTataconPointer(InputOverlayDrawableTatacon tatacon, MotionEvent event,
+          int pointerIndex)
+  {
+    final int pointerId = event.getPointerId(pointerIndex);
+    final int currentZone = tatacon.getZoneForTrackId(pointerId);
+    if (currentZone == InputOverlayDrawableTatacon.ZONE_NONE)
+      return false;
+
+    final int zone = InputOverlayDrawableTatacon.zoneForTouch(tatacon.getBounds(),
+            event.getX(pointerIndex), event.getY(pointerIndex));
+    if (zone == currentZone)
+      return false;
+
+    tatacon.setPressedState(currentZone, false);
+    tatacon.setTrackId(currentZone, -1);
+    setButton(tatacon.getControl(currentZone), false);
+
+    // If the new zone is already held by the other finger, this finger ends up with
+    // nothing pressed until it moves to a free zone.
+    if (zone != InputOverlayDrawableTatacon.ZONE_NONE && tatacon.getTrackId(zone) == -1) {
+      tatacon.setTrackId(zone, pointerId);
+      tatacon.setPressedState(zone, true);
+      setButton(tatacon.getControl(zone), true);
+      triggerTataconHapticFeedback(zone, event.getEventTime()); // Taiko drum hit
+    }
+    return true;
+  }
+
+  /** Releases the zone owned by the given pointer, leaving the other finger untouched. */
+  private boolean releaseTataconPointer(InputOverlayDrawableTatacon tatacon, int pointerId)
+  {
+    final int zone = tatacon.getZoneForTrackId(pointerId);
+    if (zone == InputOverlayDrawableTatacon.ZONE_NONE)
+      return false;
+
+    tatacon.setTrackId(zone, -1);
+    tatacon.setPressedState(zone, false);
+    setButton(tatacon.getControl(zone), false);
+    return true;
+  }
+
+  private boolean releaseAllTataconZones(InputOverlayDrawableTatacon tatacon)
+  {
+    boolean released = false;
+    for (int zone = 0; zone < InputOverlayDrawableTatacon.ZONE_COUNT; zone++) {
+      if (tatacon.getTrackId(zone) == -1 && !tatacon.getPressedState(zone))
+        continue;
+      tatacon.setTrackId(zone, -1);
+      tatacon.setPressedState(zone, false);
+      setButton(tatacon.getControl(zone), false);
+      released = true;
+    }
+    return released;
   }
 
   public boolean onTouchWhileEditing(MotionEvent event)
@@ -1458,9 +1550,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       if (joystick.getTrackId() == pointerId)
         return true;
     for (InputOverlayDrawableTatacon tatacon : overlayTatacons)
-      if (tatacon.getTrackId() == pointerId)
+      if (tatacon.isTracked(pointerId))
         return true;
-    return false;
+    return mTataconPointers.contains(pointerId);
   }
 
   private boolean isPointerOwnedByButtonDpadOrJoystick(int pointerId)

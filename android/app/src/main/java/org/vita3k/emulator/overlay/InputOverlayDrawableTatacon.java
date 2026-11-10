@@ -19,10 +19,13 @@ public final class InputOverlayDrawableTatacon
   public static final int ZONE_CROSS = 3;      // 右下，Cross
   public static final int ZONE_RIM_LEFT = 4;   // 外圈左，L1
   public static final int ZONE_RIM_RIGHT = 5;  // 外圈右，R1
+  public static final int ZONE_COUNT = 6;
 
   private int mLegacyId;
-  private int[] mControls = new int[6];
-  private int mTrackId;
+  private int[] mControls = new int[ZONE_COUNT];
+  // 每个区域独立记录占用它的手指，双指同时按住左右两侧时两个区域都能保持按下。
+  private final int[] mTrackIds = new int[ZONE_COUNT];
+  private final boolean[] mPressedZones = new boolean[ZONE_COUNT];
   private int mPreviousTouchX, mPreviousTouchY;
   private int mControlPositionX, mControlPositionY;
   private int mWidth;
@@ -34,7 +37,6 @@ public final class InputOverlayDrawableTatacon
   private int mCenterX, mCenterY;
   private int mResizeStartDist;
   private BitmapDrawable mBaseBitmap;
-  private int mActiveZone = ZONE_NONE;
   private int mOpacity = 255;
   private float mEditModeAlphaMultiplier = 1.0f;
 
@@ -42,7 +44,8 @@ public final class InputOverlayDrawableTatacon
           int upControl, int downControl, int circleControl, int crossControl,
           int rimLeftControl, int rimRightControl)
   {
-    mTrackId = -1;
+    for (int zone = 0; zone < ZONE_COUNT; zone++)
+      mTrackIds[zone] = -1;
     mBaseBitmap = new BitmapDrawable(res, baseBitmap);
     mWidth = mBaseBitmap.getIntrinsicWidth();
     mHeight = mBaseBitmap.getIntrinsicHeight();
@@ -74,11 +77,23 @@ public final class InputOverlayDrawableTatacon
     return zone == ZONE_UP || zone == ZONE_DOWN || zone == ZONE_RIM_LEFT;
   }
 
-  public void setTrackId(int trackId) { mTrackId = trackId; }
-  public int getTrackId() { return mTrackId; }
+  public void setTrackId(int zone, int trackId) { mTrackIds[zone] = trackId; }
+  public int getTrackId(int zone) { return mTrackIds[zone]; }
 
-  public void setActiveZone(int zone) { mActiveZone = zone; }
-  public int getActiveZone() { return mActiveZone; }
+  /** 该手指当前占用的区域；没有被占用时返回 ZONE_NONE。 */
+  public int getZoneForTrackId(int trackId)
+  {
+    if (trackId < 0) return ZONE_NONE;
+    for (int zone = 0; zone < ZONE_COUNT; zone++)
+      if (mTrackIds[zone] == trackId)
+        return zone;
+    return ZONE_NONE;
+  }
+
+  public boolean isTracked(int trackId) { return getZoneForTrackId(trackId) != ZONE_NONE; }
+
+  public void setPressedState(int zone, boolean pressed) { mPressedZones[zone] = pressed; }
+  public boolean getPressedState(int zone) { return mPressedZones[zone]; }
 
   /** 端口自 Cemu TaikoDrum.getZoneByPosition：椭圆判定，donRatio 取自 Cemu 已调好的比例。 */
   public static int zoneForTouch(Rect bounds, float x, float y)
@@ -109,9 +124,13 @@ public final class InputOverlayDrawableTatacon
 
   public void draw(Canvas canvas)
   {
-    boolean isPressed = mActiveZone != ZONE_NONE;
-    boolean isDonPressed = mActiveZone == ZONE_UP || mActiveZone == ZONE_DOWN
-            || mActiveZone == ZONE_CIRCLE || mActiveZone == ZONE_CROSS;
+    boolean isPressed = false;
+    boolean isDonPressed = false;
+    for (int zone = 0; zone < ZONE_COUNT; zone++) {
+      if (!mPressedZones[zone]) continue;
+      isPressed = true;
+      if (isHeadZone(zone)) isDonPressed = true;
+    }
 
     Rect bounds = mBaseBitmap.getBounds();
     float cx = bounds.exactCenterX();
