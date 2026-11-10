@@ -792,4 +792,11 @@
     <string name="settings_controls_haptic_desc">Enable haptic vibration when pressing overlay buttons. Longer vibration provides stronger feedback.</string>
     <string name="settings_controls_haptic_strength">Haptic Strength</string>
     <string name="settings_controls_haptic_strength_desc">Set the vibration intensity (0 = off). Higher values produce stronger feedback.</string>
+
+    <!-- Overlay button sliding -->
+    <string name="settings_controls_button_slide">Button Sliding</string>
+    <string name="settings_controls_button_slide_desc">Choose what happens when a finger slides from one button to another. Off: sliding does nothing. A + B: the first button stays held and the new one is added. Move: the first button is released and the new one is pressed.</string>
+    <string name="settings_controls_button_slide_both">A + B</string>
+    <string name="settings_controls_button_slide_transfer">Move</string>
+    <string name="settings_controls_button_slide_off">Off</string>
 </resources>

@@ -27,6 +27,7 @@ object OverlayStore {
     private const val KEY_OVERLAY_OPACITY_LANDSCAPE = "overlay_opacity_landscape"
     private const val KEY_HIDE_ON_CONTROLLER = "hide_overlay_on_controller"
     private const val KEY_HAPTIC_AMPLITUDE = "haptic_amplitude"
+    private const val KEY_BUTTON_SLIDE_MODE = "button_slide_mode"
     private const val KEY_HIDE_OVERLAY_TIME = "hide_overlay_time"
     private const val KEY_TOUCH_SWITCH_TILT = "overlay_touch_switch_tilt"
     private const val KEY_CONFIG_PREFIX = "config"
@@ -265,6 +266,10 @@ object OverlayStore {
                 normalizedState.config.hapticAmplitude
             )
             putInt(
+                configKey(normalizedScopeId, KEY_BUTTON_SLIDE_MODE),
+                normalizedState.config.buttonSlideMode
+            )
+            putInt(
                 configKey(normalizedScopeId, KEY_HIDE_OVERLAY_TIME),
                 normalizedState.config.hideOverlayTimeSeconds
             )
@@ -324,6 +329,10 @@ object OverlayStore {
                 fallback.hideOverlayWhenControllerConnected
             ),
             hapticAmplitude = prefs.getInt(hapticAmplitudeKey, fallback.hapticAmplitude),
+            buttonSlideMode = prefs.getInt(
+                configKey(scopeId, KEY_BUTTON_SLIDE_MODE),
+                fallback.buttonSlideMode
+            ),
             hideOverlayTimeSeconds = prefs.getInt(hideOverlayTimeKey, fallback.hideOverlayTimeSeconds),
             touchSwitchTilt = prefs.getBoolean(configKey(scopeId, KEY_TOUCH_SWITCH_TILT), fallback.touchSwitchTilt)
         ).normalized()

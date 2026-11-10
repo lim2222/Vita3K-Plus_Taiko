@@ -77,6 +77,9 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   // Pointers that went down inside the drum; they are consumed by the overlay even
   // when the touched zone is already held, so they never reach the front touchscreen.
   private final Set<Integer> mTataconPointers = new HashSet<>();
+  // Pointers that started on a normal button; only these may slide onto other buttons
+  // (a finger dragging a stick or the drum must not press face buttons on the way).
+  private final Set<Integer> mSlidePointers = new HashSet<>();
   private final Runnable mHideOverlayTicker = new Runnable() {
     @Override
     public void run() {
@@ -335,6 +338,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       releaseAllTataconZones(tatacon);
     }
     mTataconPointers.clear();
+    mSlidePointers.clear();
 
     invalidate();
   }
@@ -346,6 +350,73 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     if (legacyId != ButtonType.BUTTON_TOUCH_SWITCH && legacyId != ButtonType.BUTTON_TOUCH_HIDE)
       setButton(button.getControl(), false);
     button.setTrackId(-1);
+  }
+
+  /** One-shot toggles (touch switch, hide toggle) must not fire when a finger slides over them. */
+  private boolean isUtilityButton(InputOverlayDrawableButton button)
+  {
+    final int legacyId = button.getLegacyId();
+    return legacyId == ButtonType.BUTTON_TOUCH_SWITCH || legacyId == ButtonType.BUTTON_TOUCH_HIDE;
+  }
+
+  /** Mirrors the visibility/mask checks used when a button is first pressed. */
+  private boolean isButtonActive(InputOverlayDrawableButton button)
+  {
+    if (mOverlayConfig == null || !mOverlayConfig.isButtonVisible(button.getLegacyId()))
+      return false;
+    final int role = button.getRole();
+    if ((role & mOverlayMask) == 0)
+      return false;
+    if (mHideOverlayButtons && (role & OVERLAY_MASK_UTILITY) == 0)
+      return false;
+    return true;
+  }
+
+  /**
+   * Moves the buttons held by one finger to wherever it points now.
+   *
+   * SLIDE_TRANSFER releases the button the finger left and presses the one under it,
+   * so dragging from A to B ends up on B only. SLIDE_BOTH keeps every button the
+   * finger has visited pressed until it lifts, so dragging from A to B holds A + B.
+   *
+   * @return true if any button changed state
+   */
+  private boolean slideButtonPointer(MotionEvent event, int pointerIndex)
+  {
+    final int pointerId = event.getPointerId(pointerIndex);
+    if (!mSlidePointers.contains(pointerId))
+      return false;
+
+    final int x = (int) event.getX(pointerIndex);
+    final int y = (int) event.getY(pointerIndex);
+    final boolean keepFirst = mOverlayConfig.buttonSlideMode == OverlayConfig.SLIDE_BOTH;
+    boolean changed = false;
+
+    for (InputOverlayDrawableButton button : overlayButtons)
+    {
+      if (isUtilityButton(button)) continue;
+      if (!isButtonActive(button)) continue;
+
+      final boolean underPointer = button.getBounds().contains(x, y);
+      final boolean heldByThisPointer = button.getTrackId() == pointerId;
+
+      if (underPointer && !heldByThisPointer)
+      {
+        // Never take a button another finger is already holding.
+        if (button.getTrackId() != -1) continue;
+        button.setPressedState(true);
+        button.setTrackId(pointerId);
+        setButton(button.getControl(), true);
+        triggerHapticFeedback();
+        changed = true;
+      }
+      else if (!underPointer && heldByThisPointer && !keepFirst)
+      {
+        releaseButton(button);
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private void releaseDpad(InputOverlayDrawableDpad dpad)
@@ -518,9 +589,12 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     {
       releaseTrackedInputs(-1);
       mTataconPointers.clear();
+      mSlidePointers.clear();
     }
     else if (actionMasked == MotionEvent.ACTION_POINTER_DOWN)
       releaseTrackedInputs(event.getPointerId(event.getActionIndex()));
+    else if (actionMasked == MotionEvent.ACTION_UP || actionMasked == MotionEvent.ACTION_POINTER_UP)
+      mSlidePointers.remove(event.getPointerId(event.getActionIndex()));
 
     if (mOverlayMask == 0)
       return false;
@@ -541,7 +615,14 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     boolean concerned = false;
     boolean hideToggled = false;
 
-
+    // Sliding across buttons is handled once per pointer, not per button.
+    if (action == MotionEvent.ACTION_MOVE && !mHideOverlayButtons && mOverlayConfig != null
+            && mOverlayConfig.buttonSlideMode != OverlayConfig.SLIDE_OFF)
+    {
+      for (int i = 0; i < event.getPointerCount(); i++)
+        if (slideButtonPointer(event, i))
+          concerned = true;
+    }
 
     for (InputOverlayDrawableButton button : overlayButtons)
     {
@@ -567,6 +648,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
           {
             button.setPressedState(true);
             button.setTrackId(event.getPointerId(pointerIndex));
+            if (!isUtilityButton(button))
+              mSlidePointers.add(event.getPointerId(pointerIndex));
             concerned = true;
 
             if (legacyId == ButtonType.BUTTON_TOUCH_SWITCH)
@@ -621,27 +704,35 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
             }
 
           case MotionEvent.ACTION_MOVE:
-            if (dpad.getTrackId() == event.getPointerId(pointerIndex))
+            // Update every pointer that owns the d-pad (normally only one). Every
+            // direction is written explicitly, so a direction the finger slid away
+            // from is released instead of staying pressed forever.
+            for (int p = 0; p < event.getPointerCount(); p++)
             {
+              if (dpad.getTrackId() != event.getPointerId(p))
+                continue;
+
               concerned = true;
               // Up, Down, Left, Right
               boolean[] dpadPressed = {false, false, false, false};
+              final int touchX = (int) event.getX(p);
+              final int touchY = (int) event.getY(p);
+              final Rect bounds = dpad.getBounds();
 
-              if (dpad.getBounds().top + (dpad.getHeight() / 3) > (int) event.getY(pointerIndex))
+              if (bounds.top + (dpad.getHeight() / 3) > touchY)
                 dpadPressed[0] = true;
-              if (dpad.getBounds().bottom - (dpad.getHeight() / 3) < (int) event.getY(pointerIndex))
+              if (bounds.bottom - (dpad.getHeight() / 3) < touchY)
                 dpadPressed[1] = true;
-              if (dpad.getBounds().left + (dpad.getWidth() / 3) > (int) event.getX(pointerIndex))
+              if (bounds.left + (dpad.getWidth() / 3) > touchX)
                 dpadPressed[2] = true;
-              if (dpad.getBounds().right - (dpad.getWidth() / 3) < (int) event.getX(pointerIndex))
+              if (bounds.right - (dpad.getWidth() / 3) < touchX)
                 dpadPressed[3] = true;
 
-              // Press buttons
+              // Press and release together, so sliding from one direction to the
+              // other never leaves both held.
               for (int i = 0; i < dpadPressed.length; i++)
-              {
-                if (dpadPressed[i])
-                  setButton(dpad.getControl(i), true);
-              }
+                setButton(dpad.getControl(i), dpadPressed[i]);
+
               setDpadState(dpad, dpadPressed[0], dpadPressed[1], dpadPressed[2], dpadPressed[3]);
             }
             break;
@@ -1092,6 +1183,10 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     else if (right)
     {
       dpad.setState(InputOverlayDrawableDpad.STATE_PRESSED_RIGHT);
+    }
+    else
+    {
+      dpad.setState(InputOverlayDrawableDpad.STATE_DEFAULT);
     }
   }
 

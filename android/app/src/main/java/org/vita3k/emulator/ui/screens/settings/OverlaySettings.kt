@@ -236,6 +236,36 @@ internal fun OverlaySettingsRows(
             ),
             onShowHelp = onShowHelp
         )
+
+        val buttonSlideModes = listOf(
+            OverlayConfig.SLIDE_BOTH,
+            OverlayConfig.SLIDE_TRANSFER,
+            OverlayConfig.SLIDE_OFF
+        )
+        val buttonSlideLabels = listOf(
+            stringResource(R.string.settings_controls_button_slide_both),
+            stringResource(R.string.settings_controls_button_slide_transfer),
+            stringResource(R.string.settings_controls_button_slide_off)
+        )
+        val buttonSlideIndex = buttonSlideModes.indexOf(overlayConfig.buttonSlideMode)
+            .let { if (it < 0) buttonSlideModes.lastIndex else it }
+        SettingsScrollableChoiceSelector(
+            title = stringResource(R.string.settings_controls_button_slide),
+            options = buttonSlideLabels,
+            selectedIndex = buttonSlideIndex,
+            onSelected = { index ->
+                onOverlayConfigChange(
+                    overlayConfig.copy(buttonSlideMode = buttonSlideModes[index])
+                )
+            },
+            enabled = overlayConfig.controlsVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_button_slide),
+                body = stringResource(R.string.settings_controls_button_slide_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
         SettingsToggleRow(
             title = stringResource(R.string.settings_controls_l3r3),
             checked = overlayConfig.l3r3Visible,

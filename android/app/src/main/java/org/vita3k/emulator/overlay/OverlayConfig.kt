@@ -25,6 +25,10 @@ data class OverlayConfig(
     @JvmField
     val hapticAmplitude: Int = 255,
 
+    // What happens when a finger slides from one button to another (see the SLIDE_* constants).
+    @JvmField
+    val buttonSlideMode: Int = SLIDE_TRANSFER,
+
     @JvmField
     val screenOrientation: Int = 0, // 0=Auto, 1=Portrait, 2=Landscape
 
@@ -167,8 +171,20 @@ data class OverlayConfig(
             overlayScale = overlayScale.coerceIn(50, 150),
             overlayOpacityPortrait = overlayOpacityPortrait.coerceIn(20, 100),
             overlayOpacityLandscape = overlayOpacityLandscape.coerceIn(20, 100),
-            hideOverlayTimeSeconds = hideOverlayTimeSeconds.coerceIn(0, 300)
+            hideOverlayTimeSeconds = hideOverlayTimeSeconds.coerceIn(0, 300),
+            buttonSlideMode = buttonSlideMode.coerceIn(SLIDE_OFF, SLIDE_TRANSFER)
         )
+    }
+
+    companion object {
+        /** Sliding does nothing; a button is only pressed/released where the finger lands/lifts. */
+        const val SLIDE_OFF = 0
+
+        /** Sliding keeps the first button held and also presses the new one (A + B). */
+        const val SLIDE_BOTH = 1
+
+        /** Sliding releases the first button and presses the new one (A then B). */
+        const val SLIDE_TRANSFER = 2
     }
 }
 
