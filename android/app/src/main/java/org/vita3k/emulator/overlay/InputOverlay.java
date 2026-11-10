@@ -1447,8 +1447,10 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     int drawableX = centerX - width / 2;
     int drawableY = centerY - height / 2;
 
-    // Decide inner scale based on joystick ID
-    float innerScale = 1.375f;
+    // Draw the inner knob at the same size as the outer ring. joystick.png,
+    // joystick_pressed.png and joystick_range.png all share the same 256x256 canvas,
+    // so 1:1 reproduces exactly what you see when the images are overlaid.
+    float innerScale = 1.0f;
 
     // Now set the bounds for the InputOverlayDrawableJoystick.
     // This will dictate where on the screen (and the what the size) the InputOverlayDrawableJoystick will be.
