@@ -995,7 +995,7 @@ private fun EmbeddedSettingsTab(
                 }
             },
             onPickBackgroundVideo = {
-                activity.requestVideoPath { path ->
+                activity.requestVideoFolder { path ->
                     if (path != null) {
                         activeViewModel.setBackgroundVideo(path)
                     }

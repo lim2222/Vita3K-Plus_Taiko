@@ -114,6 +114,7 @@ public class Emulator extends SDLActivity
     private int lastTextInputType;
     private boolean hasLastTextInputState;
     private ImagePathResultCallback pendingImagePathCallback;
+    private ImagePathResultCallback pendingVideoFolderCallback;
     private String[] pendingImagePickerMimeTypes;
 
     public static Intent createLaunchIntent(Context context, String titleId, String gameTitle) {
@@ -1281,26 +1282,25 @@ public class Emulator extends SDLActivity
         launchImagePicker();
     }
 
-    public void requestVideoPath(ImagePathResultCallback onResult) {
-        pendingImagePathCallback = onResult;
-        pendingImagePickerMimeTypes = new String[]{"video/*"};
+    public void requestVideoFolder(ImagePathResultCallback onResult) {
+        pendingVideoFolderCallback = onResult;
+        pendingImagePathCallback = null;
         if (!StorageAccess.hasStorageAccess(this)) {
             requestFolderAccess();
             return;
         }
 
-        launchImagePicker();
+        showFolderDialog();
     }
 
     private void launchImagePicker() {
         final String[] mimeTypes = pendingImagePickerMimeTypes != null
                 ? pendingImagePickerMimeTypes
                 : new String[]{"image/*"};
-        final boolean isVideoPicker = mimeTypes.length > 0 && "video/*".equals(mimeTypes[0]);
         startActivityForResult(
                 Intent.createChooser(
                         StorageAccess.createFilePickerIntent(mimeTypes),
-                        isVideoPicker ? "Choose a video" : "Choose an image"),
+                        "Choose an image"),
                 FILE_DIALOG_CODE);
     }
 
@@ -1308,6 +1308,14 @@ public class Emulator extends SDLActivity
         ImagePathResultCallback callback = pendingImagePathCallback;
         pendingImagePathCallback = null;
         pendingImagePickerMimeTypes = null;
+        if (callback != null) {
+            callback.onResult(path);
+        }
+    }
+
+    private void dispatchPendingVideoFolder(String path) {
+        ImagePathResultCallback callback = pendingVideoFolderCallback;
+        pendingVideoFolderCallback = null;
         if (callback != null) {
             callback.onResult(path);
         }
@@ -1434,6 +1442,8 @@ public class Emulator extends SDLActivity
                 } else {
                     if (pendingImagePathCallback != null) {
                         dispatchPendingImagePath(null);
+                    } else if (pendingVideoFolderCallback != null) {
+                        dispatchPendingVideoFolder(null);
                     } else {
                         filedialogReturn("");
                     }
@@ -1460,6 +1470,10 @@ public class Emulator extends SDLActivity
                 final String selectedPath = resultCode == RESULT_OK && data != null && data.getData() != null
                         ? StorageAccess.resolveTreeUriToPath(this, data.getData())
                         : null;
+                if (pendingVideoFolderCallback != null) {
+                    dispatchPendingVideoFolder(selectedPath);
+                    break;
+                }
                 filedialogReturn(selectedPath != null ? selectedPath : "");
                 break;
             }

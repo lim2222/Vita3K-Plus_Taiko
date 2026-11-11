@@ -670,7 +670,7 @@
     <string name="settings_emulator_animation_background">Animation Background</string>
     <string name="settings_emulator_animation_background_desc">Play a looping video behind the game screen, filling the black margins around it in Portrait and Landscape modes. Use an H.264 MP4 video; sound is not played.</string>
     <string name="settings_emulator_background_video">Background Video</string>
-    <string name="settings_emulator_background_video_desc">Pick the video file looping behind the game screen. It must be an H.264 MP4 video.</string>
+    <string name="settings_emulator_background_video_desc">Pick a folder of videos to loop behind the game screen. The video files inside it are played one after another in name order, then repeat; they must be H.264 MP4 videos.</string>
     <string name="settings_emulator_background_video_none">Not selected</string>
     <string name="settings_background_video_resolve_failed">Failed to resolve the selected background video path.</string>
     <string name="settings_display_screen_orientation">Screen Orientation</string>

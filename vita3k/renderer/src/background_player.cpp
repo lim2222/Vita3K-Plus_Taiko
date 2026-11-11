@@ -26,6 +26,8 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -47,7 +49,38 @@ static constexpr int MAX_FRAMES_PER_UPDATE = 100;
 static constexpr double REANCHOR_THRESHOLD = 1.0;
 static constexpr double REANCHOR_FRAME_PTS = 0.1;
 
+// Video extensions accepted inside a background folder, the same whitelist
+// as PPSSPP's BackgroundPlayer. The bundled FFmpeg build only decodes
+// H.264, but matching the whole list keeps a fuller build working: files
+// that cannot be decoded are simply skipped when the playlist advances.
+static bool has_video_extension(const std::filesystem::path &path) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return ext == ".mp4" || ext == ".mkv" || ext == ".webm"
+        || ext == ".mov" || ext == ".avi";
+}
+
+// List the video files of `dir` in sorted order, like PPSSPP's
+// LoadFromBackgroundFolder.
+static std::vector<std::string> scan_video_folder(const std::string &dir) {
+    std::vector<std::string> files;
+    std::error_code ec;
+    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.is_regular_file(ec) && has_video_extension(entry.path()))
+            files.push_back(entry.path().string());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
 struct BackgroundPlayer::Context {
+    // The playlist being looped: a single file, or every video file of a
+    // directory in sorted order.
+    std::vector<std::string> playlist;
+    size_t playlist_index = 0;
+
+    // The file currently being decoded.
     std::string path;
 
     AVFormatContext *fmt = nullptr;
@@ -63,7 +96,6 @@ struct BackgroundPlayer::Context {
     std::vector<uint8_t> rgba;
     uint32_t out_width = 0;
     uint32_t out_height = 0;
-    uint64_t serial = 0;
 
     // wall-clock pacing state, ported from PPSSPP's BackgroundPlayer
     double start_time = 0.0; // wall clock of the loop start, 0 = not started yet
@@ -72,11 +104,21 @@ struct BackgroundPlayer::Context {
     bool draining = false; // demuxer hit the end, draining the decoder
 
     ~Context() {
+        free_file();
+    }
+
+    // Release the FFmpeg state of the current file. The playlist and the
+    // output buffer are kept, so playback continues seamlessly when the
+    // next file is opened into the same Context.
+    void free_file() {
         sws_freeContext(sws);
+        sws = nullptr;
         av_frame_free(&frame);
         av_packet_free(&packet);
         avcodec_free_context(&dec);
         avformat_close_input(&fmt);
+        video_stream_index = -1;
+        video_time_base = 0.0;
     }
 };
 
@@ -90,50 +132,85 @@ bool BackgroundPlayer::open(const std::string &path) {
 }
 
 bool BackgroundPlayer::open_locked(const std::string &path) {
-    if (ctx && ctx->path == path)
-        return true; // already looping this video
+    // A directory is a playlist of every video file inside it, played in
+    // sorted order; a plain file is a playlist of itself.
+    std::vector<std::string> playlist;
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        playlist = scan_video_folder(path);
+        if (playlist.empty()) {
+            LOG_ERROR("BackgroundPlayer: no video files in {}", path);
+            return false;
+        }
+    } else {
+        playlist.push_back(path);
+    }
+
+    if (ctx && ctx->playlist == playlist)
+        return true; // already looping this playlist
 
     close_locked();
 
     auto new_ctx = std::make_unique<Context>();
-    new_ctx->path = path;
+    new_ctx->playlist = std::move(playlist);
+    for (size_t i = 0; i < new_ctx->playlist.size(); i++) {
+        const std::string &file = new_ctx->playlist[i];
+        if (!open_file_locked(new_ctx.get(), file))
+            continue; // broken file, try the next one
+        new_ctx->playlist_index = i;
+        new_ctx->path = file;
+        ctx = new_ctx.release();
+        LOG_INFO("BackgroundPlayer: looping {} file(s) from {}", ctx->playlist.size(), path);
+        return true;
+    }
 
-    if (avformat_open_input(&new_ctx->fmt, path.c_str(), nullptr, nullptr) < 0) {
+    LOG_ERROR("BackgroundPlayer: no file of {} could be opened", path);
+    return false;
+}
+
+// Open `path` into the fresh FFmpeg state of `c`. Returns false with
+// everything released again when the file cannot be opened or has no
+// decodable video stream.
+bool BackgroundPlayer::open_file_locked(Context *c, const std::string &path) {
+    if (avformat_open_input(&c->fmt, path.c_str(), nullptr, nullptr) < 0) {
         LOG_ERROR("BackgroundPlayer: failed to open {}", path);
         return false;
     }
-    if (avformat_find_stream_info(new_ctx->fmt, nullptr) < 0) {
+    if (avformat_find_stream_info(c->fmt, nullptr) < 0) {
         LOG_ERROR("BackgroundPlayer: failed to read the stream info of {}", path);
+        c->free_file();
         return false;
     }
 
-    new_ctx->video_stream_index = av_find_best_stream(new_ctx->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-    if (new_ctx->video_stream_index < 0) {
+    c->video_stream_index = av_find_best_stream(c->fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (c->video_stream_index < 0) {
         LOG_ERROR("BackgroundPlayer: no video stream in {}", path);
+        c->free_file();
         return false;
     }
-    const AVStream *stream = new_ctx->fmt->streams[new_ctx->video_stream_index];
+    const AVStream *stream = c->fmt->streams[c->video_stream_index];
 
     const AVCodec *decoder = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!decoder) {
         LOG_ERROR("BackgroundPlayer: unsupported video codec in {}", path);
+        c->free_file();
         return false;
     }
-    new_ctx->dec = avcodec_alloc_context3(decoder);
-    if (!new_ctx->dec)
+    c->dec = avcodec_alloc_context3(decoder);
+    if (!c->dec) {
+        c->free_file();
         return false;
-    if (avcodec_parameters_to_context(new_ctx->dec, stream->codecpar) < 0
-        || avcodec_open2(new_ctx->dec, decoder, nullptr) < 0) {
+    }
+    if (avcodec_parameters_to_context(c->dec, stream->codecpar) < 0
+        || avcodec_open2(c->dec, decoder, nullptr) < 0) {
         LOG_ERROR("BackgroundPlayer: failed to open the video decoder for {}", path);
+        c->free_file();
         return false;
     }
 
-    new_ctx->video_time_base = av_q2d(stream->time_base);
-    new_ctx->frame = av_frame_alloc();
-    new_ctx->packet = av_packet_alloc();
-
-    ctx = new_ctx.release();
-    LOG_INFO("BackgroundPlayer: looping {}", path);
+    c->video_time_base = av_q2d(stream->time_base);
+    c->frame = av_frame_alloc();
+    c->packet = av_packet_alloc();
     return true;
 }
 
@@ -183,7 +260,7 @@ void BackgroundPlayer::promote_frame_locked() {
 
     const int64_t pts = ctx->frame->best_effort_timestamp;
     ctx->next_frame_pts = pts == AV_NOPTS_VALUE ? 0.0 : pts * ctx->video_time_base;
-    ctx->serial++;
+    serial++;
     ctx->has_frame = true;
 }
 
@@ -206,14 +283,48 @@ void BackgroundPlayer::rewind_locked() {
     open_locked(path);
 }
 
+// Move to the next file of the playlist, wrapping around. Files failing to
+// open are skipped; when all of them fail the player is closed. The Context
+// and the serial counter survive, so consumers see one continuous frame
+// stream instead of a restart.
+void BackgroundPlayer::advance_locked() {
+    ctx->free_file();
+
+    const size_t count = ctx->playlist.size();
+    for (size_t attempts = 0; attempts < count; attempts++) {
+        ctx->playlist_index = (ctx->playlist_index + 1) % count;
+        const std::string &file = ctx->playlist[ctx->playlist_index];
+        if (!open_file_locked(ctx, file))
+            continue; // broken file, try the next one
+
+        // The next file has its own resolution and timestamps, so the
+        // per-file state starts over; start_time is re-anchored on the next
+        // update and the output size is fixed again by its first frame.
+        ctx->path = file;
+        ctx->draining = false;
+        ctx->has_frame = false;
+        ctx->start_time = 0.0;
+        ctx->out_width = 0;
+        ctx->out_height = 0;
+        LOG_INFO("BackgroundPlayer: advancing to {}", file);
+        return;
+    }
+
+    LOG_WARN("BackgroundPlayer: no file left in the playlist, closing");
+    close_locked();
+}
+
 bool BackgroundPlayer::decode_next_frame_locked() {
     if (ctx->draining) {
         if (avcodec_receive_frame(ctx->dec, ctx->frame) == 0) {
             promote_frame_locked();
             return ctx->has_frame;
         }
-        // the decoder is fully drained, loop back to the beginning
-        rewind_locked();
+        // the decoder is fully drained: loop back
+        if (ctx->playlist.size() > 1)
+            advance_locked(); // next file of the playlist
+        else
+            rewind_locked(); // single file: a seek is enough
         return false;
     }
 
@@ -268,7 +379,7 @@ bool BackgroundPlayer::update(double now, const std::function<void(const Frame &
             break;
     }
 
-    if (!ctx) // the rewind fallback failed and closed the player
+    if (!ctx) // advancing or the rewind fallback failed and closed the player
         return false;
 
     if (!ctx->has_frame)
@@ -278,7 +389,7 @@ bool BackgroundPlayer::update(double now, const std::function<void(const Frame &
         ctx->rgba.data(),
         ctx->out_width,
         ctx->out_height,
-        ctx->serial
+        serial
     };
     consume(frame);
     return true;

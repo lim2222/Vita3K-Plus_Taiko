@@ -59,9 +59,12 @@ public:
     BackgroundPlayer &operator=(const BackgroundPlayer &) = delete;
 
     // Open the video at `path` (an absolute filesystem path) and loop it.
-    // Re-opening the same path is a no-op, so this can be called on every
-    // config apply. Returns false when the file cannot be opened or has no
-    // decodable video stream; in that case the player stays closed.
+    // `path` can also be a directory: every video file inside it is then
+    // played in sorted order and the playlist loops forever. Re-opening the
+    // same file or directory is a no-op, so this can be called on every
+    // config apply. Returns false when nothing can be opened (missing file,
+    // empty directory, no decodable video stream); in that case the player
+    // stays closed.
     bool open(const std::string &path);
 
     void close();
@@ -78,6 +81,8 @@ private:
     struct Context;
 
     bool open_locked(const std::string &path);
+    bool open_file_locked(Context *c, const std::string &path);
+    void advance_locked();
     void close_locked();
     bool decode_next_frame_locked();
     void promote_frame_locked();
@@ -85,6 +90,10 @@ private:
 
     mutable std::mutex mutex;
     Context *ctx = nullptr;
+    // Counts up on every decoded frame, across playlist entries and
+    // re-opens: consumers deduplicate uploads on it, so a value must never
+    // repeat, not even after closing and opening the player again.
+    uint64_t serial = 0;
 };
 
 } // namespace renderer

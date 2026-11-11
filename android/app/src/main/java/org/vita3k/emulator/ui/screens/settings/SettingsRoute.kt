@@ -69,7 +69,6 @@ private val CUSTOM_DRIVER_MIME_TYPES = arrayOf(
     "application/octet-stream"
 )
 private val IMAGE_MIME_TYPES = arrayOf("image/*")
-private val VIDEO_MIME_TYPES = arrayOf("video/*")
 
 private fun formatRestartRequiredSettings(
     context: android.content.Context,
@@ -187,7 +186,7 @@ fun SettingsRoute(
 
     fun pickBackgroundVideo() {
         val activity = context as? MainActivity ?: return
-        activity.requestFilePath(VIDEO_MIME_TYPES) { path ->
+        activity.requestFolderPath { path ->
             if (path != null) {
                 viewModel.setBackgroundVideo(path)
             }
