@@ -27,7 +27,6 @@
 #include <display/state.h>
 #include <jni.h>
 #include <renderer/state.h>
-#include <rtc/rtc.h>
 #include <touch/functions.h>
 
 #include <algorithm>
@@ -36,21 +35,34 @@
 static int virtual_joystick_id = -1;
 static SDL_Joystick *virtual_joystick = nullptr;
 
-// Pushes the fast forward state into the emulator. The vblank thread is the
-// source of truth: every tick it applies the effective speed to the guest clock
-// and the audio producer, and shortens the vblank period. This function only
-// requests a speed (and drops vsync so presenting does not cap it).
-static void apply_fast_forward(EmuEnvState &emuenv, const bool enable, const int speed) {
-    const int multiplier = enable ? std::clamp(speed, 2, 4) : 1;
-    emuenv.display.fast_forward_speed.store(multiplier, std::memory_order_relaxed);
-    if (multiplier == 1) {
-        // Make disabling immediate instead of waiting for the next vblank (the
-        // controller can also be detached while the emulator is paused).
-        emuenv.audio.fast_forward_speed.store(1, std::memory_order_relaxed);
-        rtc_set_time_scale(1);
-    }
+// Applies the requested overlay speed to vsync and nothing else. The vblank
+// thread is the single publisher of the effective fraction: every tick it
+// applies it to the guest clock, the audio producer and the vblank period,
+// suspends fast forward while the game is loading and flushes the audio
+// queues when slow motion is left. Publishing only there keeps the clock, the
+// audio and the vblanks from ever running at different speeds during a
+// transition; a request lands within one period (16 ms at normal speed).
+static void apply_overlay_vsync(EmuEnvState &emuenv) {
+    const int fast_forward = std::clamp(emuenv.display.fast_forward_speed.load(std::memory_order_relaxed), 1, 4);
+    const int slow_motion = std::clamp(emuenv.display.slow_motion_divisor.load(std::memory_order_relaxed), 1, 4);
+    // Fast forward wins if both are latched (the overlay keeps them exclusive).
+    const int num = fast_forward > 1 ? fast_forward : 1;
+    const int den = (fast_forward > 1 || slow_motion <= 1) ? 1 : slow_motion;
+
+    // Vsync only caps presenting when the emulator runs faster than the display;
+    // slow motion never exceeds the refresh rate, so it can keep vsync enabled.
     if (emuenv.renderer)
-        emuenv.renderer->set_vsync_state(multiplier == 1 ? emuenv.cfg.current_config.v_sync : false);
+        emuenv.renderer->set_vsync_state(num > den ? false : emuenv.cfg.current_config.v_sync);
+}
+
+static void set_overlay_fast_forward(EmuEnvState &emuenv, const bool enable, const int speed) {
+    emuenv.display.fast_forward_speed.store(enable ? std::clamp(speed, 2, 4) : 1, std::memory_order_relaxed);
+    apply_overlay_vsync(emuenv);
+}
+
+static void set_overlay_slow_motion(EmuEnvState &emuenv, const bool enable, const int divisor) {
+    emuenv.display.slow_motion_divisor.store(enable ? std::clamp(divisor, 2, 4) : 1, std::memory_order_relaxed);
+    apply_overlay_vsync(emuenv);
 }
 
 static void refresh_overlay_controllers() {
@@ -70,9 +82,12 @@ void detach_overlay_virtual_controller() {
     virtual_joystick = nullptr;
     virtual_joystick_id = -1;
     // The overlay is going away (session end, controller connected, app to the
-    // background), so never leave the emulator running at a multiplier.
-    if (auto *emuenv = get_emuenv())
-        apply_fast_forward(*emuenv, false, 1);
+    // background), so never leave the emulator running at another speed.
+    if (auto *emuenv = get_emuenv()) {
+        emuenv->display.fast_forward_speed.store(1, std::memory_order_relaxed);
+        emuenv->display.slow_motion_divisor.store(1, std::memory_order_relaxed);
+        apply_overlay_vsync(*emuenv);
+    }
     refresh_overlay_controllers();
 }
 
@@ -143,7 +158,16 @@ Java_org_vita3k_emulator_overlay_InputOverlay_setFastForward(JNIEnv *env, jobjec
     if (!emuenv)
         return;
 
-    apply_fast_forward(*emuenv, enable != JNI_FALSE, static_cast<int>(speed));
+    set_overlay_fast_forward(*emuenv, enable != JNI_FALSE, static_cast<int>(speed));
+}
+
+JNIEXPORT void JNICALL
+Java_org_vita3k_emulator_overlay_InputOverlay_setSlowMotion(JNIEnv *env, jobject thiz, jboolean enable, jint divisor) {
+    auto *emuenv = get_emuenv();
+    if (!emuenv)
+        return;
+
+    set_overlay_slow_motion(*emuenv, enable != JNI_FALSE, static_cast<int>(divisor));
 }
 
 JNIEXPORT void JNICALL

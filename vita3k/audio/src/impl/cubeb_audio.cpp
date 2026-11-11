@@ -39,7 +39,7 @@ static int unplayed_frames(const CubebAudioOutPort &port, const uint64_t now) {
 static int pacing_threshold(const CubebAudioOutPort &port) {
     const int callback = static_cast<int>(std::max(port.latency_frames, port.max_callback_frames));
     const int wanted = std::max(3 * callback, AUDIO_MIN_QUEUE_MS * static_cast<int>(port.spec.rate) / 1000);
-    const int capacity = static_cast<int>(port.audio_buffers.size() - 1) * port.len_bytes / std::max(port.frame_bytes, 1);
+    const int capacity = static_cast<int>(port.audio_buffers.size() - 1) * port.slot_bytes / std::max(port.frame_bytes, 1);
     return std::min(wanted, capacity);
 }
 
@@ -78,7 +78,10 @@ static long impl_cubeb_audio_callback(cubeb_stream *stream, void *user_data, con
 
     lock.lock();
     port->next_audio_buffer = next;
-    port->nb_buffers_ready -= released;
+    // flush_port can drop the ready buffers between the unlock above and this
+    // point, so never let the count go negative (a negative count would make
+    // the producer index ready slots with a negative modulo).
+    port->nb_buffers_ready = std::max(0, port->nb_buffers_ready - released);
     port->queued_bytes = std::max(0, port->queued_bytes - bytes_given);
     if (port->callbacks >= 8)
         port->max_callback_frames = std::max(port->max_callback_frames, static_cast<uint32_t>(nframes));
@@ -142,6 +145,10 @@ AudioOutPortPtr CubebAudioAdapter::open_port(int nb_channels, int freq, int nb_s
     }
 
     port->len_bytes = nb_sample * nb_channels * sizeof(uint16_t);
+    // Slow motion can expand one guest chunk up to 4x (0.25x), so each slot must
+    // hold the largest resampled output; the slot count already accounts for it.
+    constexpr int max_time_scale = 4;
+    port->slot_bytes = port->len_bytes * max_time_scale;
     port->len_microseconds = static_cast<uint64_t>(nb_sample) * 1'000'000ULL / freq;
     port->frame_bytes = nb_channels * sizeof(uint16_t);
     port->latency_frames = latency;
@@ -149,14 +156,13 @@ AudioOutPortPtr CubebAudioAdapter::open_port(int nb_channels, int freq, int nb_s
     const uint32_t sample_count = static_cast<uint32_t>(nb_sample);
     const uint32_t min_queue_frames = static_cast<uint32_t>(freq) * AUDIO_MIN_QUEUE_MS / 1000;
     const uint32_t threshold = std::max(3 * latency, min_queue_frames);
-    // Fast forward stores resampled chunks up to MAX_FAST_FORWARD times shorter
-    // than len_bytes, so keep enough slots to hold the same audio duration.
-    constexpr int max_fast_forward = 4;
-    const int nb_buffers = ((static_cast<int>((2 * threshold + sample_count - 1) / sample_count) + 1) * max_fast_forward);
+    // Time scaling stores resampled chunks shorter or longer than len_bytes, so
+    // keep enough slots to hold the same audio duration at the largest ratio.
+    const int nb_buffers = ((static_cast<int>((2 * threshold + sample_count - 1) / sample_count) + 1) * max_time_scale);
     port->audio_buffers.resize(nb_buffers);
     for (AudioBuffer &audio_buffer : port->audio_buffers) {
         // initialize all the buffers
-        audio_buffer.buffer.resize(port->len_bytes);
+        audio_buffer.buffer.resize(port->slot_bytes);
         audio_buffer.buffer_position = 0;
         audio_buffer.valid_bytes = 0;
     }
@@ -173,7 +179,16 @@ void CubebAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer,
     if (out_port.stopping)
         return;
 
-    const uint64_t deadline = steady_now_us() + 2 * port.len_microseconds;
+    // Pacing deadline: 2 * len_microseconds must be enough wall time for this
+    // chunk to drain, otherwise the producer force-pushes it into a still-full
+    // queue. Slow motion expands chunks up to 4x their guest duration, so the
+    // deadline grows with the chunk; the floor keeps normal speed and fast
+    // forward (whose chunks are shorter) on the previous behaviour.
+    const uint64_t chunk_us = port.len_bytes > 0
+        ? static_cast<uint64_t>(port.len_microseconds) * static_cast<uint64_t>(std::max(bytes, 0))
+            / static_cast<uint64_t>(port.len_bytes)
+        : port.len_microseconds;
+    const uint64_t deadline = steady_now_us() + 2 * std::max<uint64_t>(port.len_microseconds, chunk_us);
     for (;;) {
         const uint64_t now = steady_now_us();
         const int pending = queued_frames(port) + unplayed_frames(port, now);
@@ -192,7 +207,7 @@ void CubebAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer,
     assert(port.nb_buffers_ready < port.audio_buffers.size());
     if (buffer) {
         // the buffer can be empty to drain the port
-        const int valid_bytes = std::clamp(bytes, 0, port.len_bytes);
+        const int valid_bytes = std::clamp(bytes, 0, port.slot_bytes);
         if (valid_bytes > 0) {
             int next_buffer_pos = (port.next_audio_buffer + port.nb_buffers_ready) % port.audio_buffers.size();
             // we could unlock the lock here and re-lock it right after, but will this be faster?
@@ -237,4 +252,29 @@ void CubebAudioAdapter::wake_all_ports() {
         }
         port.cond_var.notify_all();
     }
+}
+
+void CubebAudioAdapter::flush_port(AudioOutPort &out_port) {
+    CubebAudioOutPort &port = static_cast<CubebAudioOutPort &>(out_port);
+    {
+        const std::lock_guard<std::mutex> lock(port.mutex);
+        // Drop the queued chunks without freeing the slots: the cubeb callback
+        // walks them lock-free, so zeroing valid_bytes makes it skip over them
+        // (silence) instead of reading stale lengths.
+        const int size = static_cast<int>(port.audio_buffers.size());
+        if (size > 0) {
+            for (int i = 0; i < port.nb_buffers_ready; i++) {
+                AudioBuffer &audio_buffer = port.audio_buffers[(port.next_audio_buffer + i) % size];
+                audio_buffer.buffer_position = 0;
+                audio_buffer.valid_bytes = 0;
+            }
+        }
+        port.nb_buffers_ready = 0;
+        port.queued_bytes = 0;
+        // The device still holds at most the current callback; restart the
+        // pacing and rest-sample estimates from an empty queue.
+        port.play_end_us = steady_now_us();
+    }
+    // Wake a producer parked on the old (oversized) queue depth right away.
+    port.cond_var.notify_all();
 }

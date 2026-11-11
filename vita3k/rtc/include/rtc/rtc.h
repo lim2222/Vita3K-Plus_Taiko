@@ -107,14 +107,16 @@ void rtc_set_clock_paused(bool paused);
 // closed while paused does not leak into the new game.
 void rtc_reset_clock_state();
 
-// Scale the guest-visible clock relative to wall time. 1 = normal speed, 2..8
-// = fast forward. The clock stays monotonic when the scale changes; pause
-// bookkeeping is preserved.
-void rtc_set_time_scale(int scale);
+// Scale the guest-visible clock relative to wall time by num/den: 1/1 = normal
+// speed, 2/1..8/1 = fast forward, 1/2 or 1/4 = slow motion. The clock stays
+// monotonic when the scale changes; pause bookkeeping is preserved.
+void rtc_set_time_scale(int num, int den);
 
-// Current guest clock multiplier (1 when not fast forwarding). Callers that
-// convert a remaining guest duration into a host wait time must divide by it.
-int rtc_get_time_scale();
+// Current guest clock multiplier as a fraction. Callers that convert a
+// remaining guest duration into a host wait time must multiply by den and
+// divide by num.
+int rtc_get_time_scale_num();
+int rtc_get_time_scale_den();
 
 // Freeze-aware host clock in Vita microseconds (VITA_CLOCKS_PER_SEC units).
 // While paused this stops advancing; on resume it continues without a jump.

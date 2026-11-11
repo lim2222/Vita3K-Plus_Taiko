@@ -82,6 +82,10 @@ public:
     virtual void switch_state(const bool pause) {}
     virtual int get_rest_sample(AudioOutPort &out_port) { return 0; };
     virtual void wake_all_ports() {}
+    // Drop everything queued in this port. Used when the effective time scale
+    // changes away from slow motion, whose expanded backlog would otherwise
+    // drain slower than the new speed and stall the guest sound thread.
+    virtual void flush_port(AudioOutPort &out_port) {}
     friend struct AudioState;
 };
 
@@ -94,10 +98,12 @@ struct AudioState {
     std::string audio_backend;
     float global_volume = 1;
 
-    // Overlay fast forward multiplier (1 = normal). Above 1 the guest audio is
-    // resampled to play faster, so the guest sound thread keeps advancing at
-    // the same rate as the scaled guest clock and stays in sync after FF ends.
-    std::atomic<int> fast_forward_speed{ 1 };
+    // Overlay time scale as a fraction: 1/1 = normal, N/1 = fast forward,
+    // 1/N = slow motion. The guest audio is resampled accordingly so the guest
+    // sound thread keeps advancing at the same rate as the scaled guest clock
+    // and stays in sync when the speed changes back.
+    std::atomic<int> time_scale_num{ 1 };
+    std::atomic<int> time_scale_den{ 1 };
 
     bool init(const std::string &adapter_name);
     void deinit();
@@ -109,5 +115,11 @@ struct AudioState {
     void set_global_volume(float volume);
     void switch_state(const bool pause);
     int get_rest_sample(AudioOutPort &out_port);
+    // The vblank thread calls this whenever the effective time scale changes.
+    // Leaving slow motion drops the queued audio, because those chunks were
+    // expanded to span up to 4x their guest duration: draining them at the new,
+    // faster speed would park the guest sound thread (and the game logic
+    // coupled to it) behind the picture for that whole span.
+    void on_time_scale_changed(int old_num, int old_den, int new_num, int new_den);
     void wake_all_ports();
 };

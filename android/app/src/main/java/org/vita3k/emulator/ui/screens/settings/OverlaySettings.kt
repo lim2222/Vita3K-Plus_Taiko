@@ -45,6 +45,7 @@ private fun officialButtonName(legacyId: Int): String = when (legacyId) {
     ButtonType.BUTTON_TOUCH_HIDE -> "Hide Toggle"
 	ButtonType.TATACON -> "Taiko Drum"
     ButtonType.BUTTON_FAST_FORWARD -> "Fast Forward"
+    ButtonType.BUTTON_SLOW_MOTION -> "Slow Motion"
     else -> "Button $legacyId"
 }
 
@@ -146,12 +147,13 @@ internal fun OverlaySettingsRows(
             id != ButtonType.TRIGGER_R2 &&
             id != ButtonType.TRIGGER_L3 &&
             id != ButtonType.TRIGGER_R3 &&
-            // Utility buttons (Touch Switch / Hide Toggle / Fast Forward) have their own
-            // dedicated toggle rows below; showing them here too would require enabling
-            // two switches for a single button.
+            // Utility buttons (Touch Switch / Hide Toggle / Fast Forward / Slow Motion)
+            // have their own dedicated toggle rows below; showing them here too would
+            // require enabling two switches for a single button.
             id != ButtonType.BUTTON_TOUCH_SWITCH &&
             id != ButtonType.BUTTON_TOUCH_HIDE &&
-            id != ButtonType.BUTTON_FAST_FORWARD
+            id != ButtonType.BUTTON_FAST_FORWARD &&
+            id != ButtonType.BUTTON_SLOW_MOTION
         }.forEach { id ->
             SettingsToggleRow(
                 title = officialButtonName(id),
@@ -345,6 +347,39 @@ internal fun OverlaySettingsRows(
             help = SettingsHelpEntry(
                 title = stringResource(R.string.settings_controls_fast_forward_speed),
                 body = stringResource(R.string.settings_controls_fast_forward_speed_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
+        SettingsToggleRow(
+            title = stringResource(R.string.settings_controls_slow_motion),
+            checked = overlayConfig.slowMotionVisible,
+            onCheckedChange = { onOverlayConfigChange(overlayConfig.withSlowMotionVisible(it)) },
+            enabled = overlayConfig.controlsVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_slow_motion),
+                body = stringResource(R.string.settings_controls_slow_motion_desc),
+                scope = SettingsScope.Global
+            ),
+            onShowHelp = onShowHelp
+        )
+        val slowMotionDivisors = listOf(2, 4)
+        val slowMotionLabels = slowMotionDivisors.map {
+            stringResource(R.string.settings_controls_slow_motion_speed_value, if (it == 2) "0.5" else "0.25")
+        }
+        val slowMotionIndex = slowMotionDivisors.indexOf(overlayConfig.slowMotionDivisor)
+            .let { if (it < 0) slowMotionDivisors.indexOf(2) else it }
+        SettingsScrollableChoiceSelector(
+            title = stringResource(R.string.settings_controls_slow_motion_speed),
+            options = slowMotionLabels,
+            selectedIndex = slowMotionIndex,
+            onSelected = { index ->
+                onOverlayConfigChange(overlayConfig.copy(slowMotionDivisor = slowMotionDivisors[index]))
+            },
+            enabled = overlayConfig.controlsVisible && overlayConfig.slowMotionVisible,
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_controls_slow_motion_speed),
+                body = stringResource(R.string.settings_controls_slow_motion_speed_desc),
                 scope = SettingsScope.Global
             ),
             onShowHelp = onShowHelp

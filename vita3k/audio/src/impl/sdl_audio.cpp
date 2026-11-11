@@ -136,14 +136,26 @@ void SDLAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer, i
     if (out_port.stopping)
         return;
 
-    const int valid_bytes = std::clamp(bytes, 0, out_port.len_bytes);
+    // Slow motion can expand one guest chunk up to 4x (0.25x); SDL copies any
+    // amount into its stream, so only keep the defensive upper bound in sync.
+    constexpr int max_time_scale = 4;
+    const int valid_bytes = std::clamp(bytes, 0, out_port.len_bytes * max_time_scale);
     if (!buffer || valid_bytes <= 0)
         return;
 
     //  Put audio to the port's stream and see how much is left to play.
     SDLAudioOutPort &port = static_cast<SDLAudioOutPort &>(out_port);
     const int threshold = get_threshold_samples(device_buffer_samples, dst_spec.freq);
-    const uint64_t deadline = steady_now_us() + port.len_microseconds * 2;
+    // Pacing deadline: 2 * len_microseconds must be enough wall time for this
+    // chunk to drain, otherwise the producer force-pushes it into a still-full
+    // queue. Slow motion expands chunks up to 4x their guest duration, so the
+    // deadline grows with the chunk; the floor keeps normal speed and fast
+    // forward (whose chunks are shorter) on the previous behaviour.
+    const uint64_t chunk_us = out_port.len_bytes > 0
+        ? out_port.len_microseconds * static_cast<uint64_t>(valid_bytes)
+            / static_cast<uint64_t>(out_port.len_bytes)
+        : out_port.len_microseconds;
+    const uint64_t deadline = steady_now_us() + 2 * std::max<uint64_t>(out_port.len_microseconds, chunk_us);
     for (;;) {
         if (paused.load(std::memory_order_relaxed)) {
             // While the session is paused the device is frozen, so the stream can
@@ -200,4 +212,15 @@ void SDLAudioAdapter::wake_all_ports() {
         }
         port.cond_var.notify_all();
     }
+}
+
+void SDLAudioAdapter::flush_port(AudioOutPort &out_port) {
+    SDLAudioOutPort &port = static_cast<SDLAudioOutPort &>(out_port);
+    // SDL copies any amount into the stream, so dropping it is all it takes.
+    SDL_CHECK_VOID(SDL_ClearAudioStream(port.stream.get()));
+    port.play_end_us.store(steady_now_us(), std::memory_order_relaxed);
+    // Signal a pull so a producer parked on the old (oversized) queue depth
+    // rechecks it right away instead of sleeping out its wait.
+    port.pull_seq.fetch_add(1, std::memory_order_release);
+    port.cond_var.notify_all();
 }

@@ -42,9 +42,11 @@ struct CubebAudioOutPort : AudioOutPort {
     // position of the next audio buffer to put audio
     int next_audio_buffer = 0;
     int nb_buffers_ready = 0;
-    // bytes of real audio queued in the ready buffers (varies during FF)
+    // bytes of real audio queued in the ready buffers (varies with time scale)
     int queued_bytes = 0;
     int frame_bytes = 0;
+    // slot capacity: >= len_bytes; slow motion can expand a guest chunk up to 4x
+    int slot_bytes = 0;
     // callback size cubeb reported, and the largest steady callback so far
     uint32_t latency_frames = 0;
     uint32_t max_callback_frames = 0;
@@ -70,4 +72,5 @@ public:
     int get_rest_sample(AudioOutPort &out_port) override;
     void switch_state(const bool pause) override;
     void wake_all_ports() override;
+    void flush_port(AudioOutPort &out_port) override;
 };

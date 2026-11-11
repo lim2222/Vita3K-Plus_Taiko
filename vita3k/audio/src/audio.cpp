@@ -29,9 +29,10 @@
 #include <vector>
 
 bool AudioState::init(const std::string &adapter_name) {
-    // A session can end while fast forward is latched; never start the next game
+    // A session can end while a time scale is latched; never start the next game
     // with a stale multiplier before the display thread publishes its own.
-    fast_forward_speed.store(1, std::memory_order_relaxed);
+    time_scale_num.store(1, std::memory_order_relaxed);
+    time_scale_den.store(1, std::memory_order_relaxed);
 
     set_backend(adapter_name);
     if (!adapter)
@@ -107,17 +108,19 @@ void AudioState::audio_output(AudioOutPort &out_port, const void *buffer) {
     if (out_port.stopping)
         return;
 
-    const int speed = std::clamp(fast_forward_speed.load(std::memory_order_relaxed), 1, 8);
-    if (!buffer || speed <= 1 || out_port.len_bytes <= 0) {
+    const int scale_num = std::clamp(time_scale_num.load(std::memory_order_relaxed), 1, 8);
+    const int scale_den = std::clamp(time_scale_den.load(std::memory_order_relaxed), 1, 8);
+    if (!buffer || (scale_num == scale_den) || out_port.len_bytes <= 0) {
         adapter->audio_output(out_port, buffer, out_port.len_bytes);
         return;
     }
 
-    // Fast forward: compress the guest chunk so the host queue drains `speed`
-    // times faster. The guest sound thread is paced by that queue, so it
-    // advances at the same rate as the scaled guest clock. Linear interpolation
-    // keeps the stream continuous; the pitch rises, which is the usual
-    // fast-forward sound and avoids adding a time-stretching dependency.
+    // Fast forward / slow motion: rescale the guest chunk so the host queue
+    // drains at a different rate. The guest sound thread is paced by that
+    // queue, so it advances at the same rate as the scaled guest clock. Linear
+    // interpolation keeps the stream continuous; the pitch rises while fast
+    // forwarding and drops while slow motion is active, which avoids adding a
+    // time-stretching dependency.
     constexpr int sample_bytes = static_cast<int>(sizeof(int16_t));
     const int channels = (out_port.len > 0)
         ? std::clamp(out_port.len_bytes / (out_port.len * sample_bytes), 1, 2)
@@ -129,7 +132,7 @@ void AudioState::audio_output(AudioOutPort &out_port, const void *buffer) {
         return;
     }
 
-    const int out_frames = std::max(1, in_frames / speed);
+    const int out_frames = std::max(1, static_cast<int>(static_cast<int64_t>(in_frames) * scale_den / scale_num));
     std::vector<int16_t> resampled(static_cast<size_t>(out_frames) * channels);
     const int16_t *in = static_cast<const int16_t *>(buffer);
     const double step = static_cast<double>(in_frames) / static_cast<double>(out_frames);
@@ -168,11 +171,29 @@ void AudioState::switch_state(const bool pause) {
 
 int AudioState::get_rest_sample(AudioOutPort &out_port) {
     const int rest = adapter->get_rest_sample(out_port);
-    // Fast forward compresses every queued guest chunk, so one host frame left
-    // in the queue still spans `speed` guest samples. Report guest units, which
-    // is what the caller asks for.
-    const int speed = std::clamp(fast_forward_speed.load(std::memory_order_relaxed), 1, 8);
-    return speed > 1 ? rest * speed : rest;
+    // A rescaled queue of `rest` host frames spans rest*num/den guest samples,
+    // which is the unit the caller (sceAudioOutGetRestSample) asks for.
+    const int scale_num = std::clamp(time_scale_num.load(std::memory_order_relaxed), 1, 8);
+    const int scale_den = std::clamp(time_scale_den.load(std::memory_order_relaxed), 1, 8);
+    if (scale_num == scale_den)
+        return rest;
+    return static_cast<int>(static_cast<int64_t>(rest) * scale_num / scale_den);
+}
+
+void AudioState::on_time_scale_changed(const int old_num, const int old_den, const int new_num, const int new_den) {
+    // Only leaving slow motion needs the flush: fast forward's compressed
+    // backlog already drains faster than real time, and entering slow motion
+    // only leaves a normal-sized chunk in the queue.
+    const bool was_slow_motion = old_den > old_num;
+    const bool now_faster = static_cast<int64_t>(new_num) * old_den > static_cast<int64_t>(old_num) * new_den;
+    if (!was_slow_motion || !now_faster)
+        return;
+
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!adapter)
+        return;
+    for (auto &[_, port] : out_ports)
+        adapter->flush_port(*port);
 }
 
 void AudioState::wake_all_ports() {

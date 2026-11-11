@@ -31,6 +31,7 @@ object OverlayStore {
     private const val KEY_HIDE_OVERLAY_TIME = "hide_overlay_time"
     private const val KEY_TOUCH_SWITCH_TILT = "overlay_touch_switch_tilt"
     private const val KEY_FAST_FORWARD_SPEED = "fast_forward_speed"
+    private const val KEY_SLOW_MOTION_DIVISOR = "slow_motion_divisor"
     private const val KEY_CONFIG_PREFIX = "config"
     private const val KEY_LAYOUT_PREFIX = "layout"
     private const val KEY_POSITION_X_SUFFIX = ":x"
@@ -81,6 +82,7 @@ object OverlayStore {
         OverlayPositionDefaults(ButtonType.BUTTON_TOUCH_HIDE, R.integer.BUTTON_TOUCH_HIDE_X, R.integer.BUTTON_TOUCH_HIDE_Y),
         OverlayPositionDefaults(ButtonType.BUTTON_TOUCH_SWITCH, R.integer.BUTTON_TOUCH_SWITCH_X, R.integer.BUTTON_TOUCH_SWITCH_Y),
         OverlayPositionDefaults(ButtonType.BUTTON_FAST_FORWARD, R.integer.BUTTON_FAST_FORWARD_X, R.integer.BUTTON_FAST_FORWARD_Y),
+        OverlayPositionDefaults(ButtonType.BUTTON_SLOW_MOTION, R.integer.BUTTON_SLOW_MOTION_X, R.integer.BUTTON_SLOW_MOTION_Y),
 		OverlayPositionDefaults(ButtonType.TATACON, R.integer.BUTTON_TATACON_X, R.integer.BUTTON_TATACON_Y)
     )
 
@@ -277,6 +279,7 @@ object OverlayStore {
             )
             putBoolean(configKey(normalizedScopeId, KEY_TOUCH_SWITCH_TILT), normalizedState.config.touchSwitchTilt)
             putInt(configKey(normalizedScopeId, KEY_FAST_FORWARD_SPEED), normalizedState.config.fastForwardSpeed)
+            putInt(configKey(normalizedScopeId, KEY_SLOW_MOTION_DIVISOR), normalizedState.config.slowMotionDivisor)
             saveLayoutEntries(this, normalizedScopeId, normalizedState.layout)
             if (markOverride && normalizedScopeId.isNotEmpty()) {
                 putBoolean(overrideEnabledKey(normalizedScopeId), true)
@@ -338,6 +341,7 @@ object OverlayStore {
             ),
             hideOverlayTimeSeconds = prefs.getInt(hideOverlayTimeKey, fallback.hideOverlayTimeSeconds),
             fastForwardSpeed = prefs.getInt(configKey(scopeId, KEY_FAST_FORWARD_SPEED), fallback.fastForwardSpeed),
+            slowMotionDivisor = prefs.getInt(configKey(scopeId, KEY_SLOW_MOTION_DIVISOR), fallback.slowMotionDivisor),
             touchSwitchTilt = prefs.getBoolean(configKey(scopeId, KEY_TOUCH_SWITCH_TILT), fallback.touchSwitchTilt)
         ).normalized()
     }
@@ -548,6 +552,7 @@ object OverlayStore {
         editor.remove(configKey(scopeId, KEY_HIDE_ON_CONTROLLER))
         editor.remove(configKey(scopeId, KEY_HIDE_OVERLAY_TIME))
         editor.remove(configKey(scopeId, KEY_FAST_FORWARD_SPEED))
+        editor.remove(configKey(scopeId, KEY_SLOW_MOTION_DIVISOR))
         defaultEntries.forEach { entry ->
             // Remove both portrait and landscape keys
             editor.remove(positionKey(scopeId, entry.buttonType, KEY_POSITION_X_SUFFIX, true))

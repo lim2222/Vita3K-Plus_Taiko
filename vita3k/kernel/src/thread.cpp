@@ -125,12 +125,17 @@ bool ThreadState::wait_for_run_precise(std::unique_lock<std::mutex> &lock, int64
         const std::uint64_t left = want - elapsed;
         // While paused guest time does not advance, so waiting for the whole
         // remaining host duration would let the wait complete; poll at a low
-        // rate instead and only ever count guest time. During fast forward guest
-        // time runs faster than host time, so a remaining guest duration maps to
-        // a shorter host wait (the loop rechecks anyway if the speed changes).
+        // rate instead and only ever count guest time. Otherwise convert the
+        // remaining guest duration into host time with the current scale: fast
+        // forward needs a shorter wait (den/num < 1), slow motion a longer one.
+        // The loop rechecks the guest clock anyway if the speed changes.
+        const int scale_num = std::max(rtc_get_time_scale_num(), 1);
+        const int scale_den = std::max(rtc_get_time_scale_den(), 1);
+        const std::int64_t host_left = static_cast<std::int64_t>(left * static_cast<std::uint64_t>(scale_den)
+            / static_cast<std::uint64_t>(scale_num));
         const auto step = rtc_clock_is_paused()
             ? std::chrono::milliseconds(100)
-            : std::chrono::microseconds(std::max<int64_t>(1, static_cast<int64_t>(left) / rtc_get_time_scale()));
+            : std::chrono::microseconds(std::max<std::int64_t>(1, host_left));
         status_cond.wait_for(lock, step);
     }
 }

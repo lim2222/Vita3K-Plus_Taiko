@@ -27,4 +27,5 @@ public final class ButtonType {
     public static final int BUTTON_TOUCH_SWITCH = 1024;
     public static final int TATACON = 30;
     public static final int BUTTON_FAST_FORWARD = 31;
+    public static final int BUTTON_SLOW_MOTION = 32;
 }

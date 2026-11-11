@@ -46,6 +46,7 @@ public:
     void set_volume(AudioOutPort &out_port, float volume) override;
     int get_rest_sample(AudioOutPort &out_port) override;
     void wake_all_ports() override;
+    void flush_port(AudioOutPort &out_port) override;
 };
 
 using AudioStreamPtr = std::shared_ptr<SDL_AudioStream>;

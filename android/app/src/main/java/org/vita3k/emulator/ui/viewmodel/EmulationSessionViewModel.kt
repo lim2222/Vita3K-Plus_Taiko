@@ -39,6 +39,7 @@ data class EmulationSessionUiState(
     val buttonSlideMode: Int = OverlayConfig.SLIDE_TRANSFER,
     val hideOverlayTimeSeconds: Int = 10,
     val fastForwardSpeed: Int = 3,
+    val slowMotionDivisor: Int = 2,
     val touchSwitchTilt: Boolean = false,
     val controllerConnected: Boolean = false,
     val statusMessage: String? = null,
@@ -366,6 +367,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             buttonSlideMode = uiState.buttonSlideMode,
             hideOverlayTimeSeconds = uiState.hideOverlayTimeSeconds,
             fastForwardSpeed = uiState.fastForwardSpeed,
+            slowMotionDivisor = uiState.slowMotionDivisor,
             touchSwitchTilt = uiState.touchSwitchTilt
         ).normalized()
     }
@@ -475,6 +477,7 @@ class EmulationSessionViewModel(application: Application) : AndroidViewModel(app
             buttonSlideMode = normalized.buttonSlideMode,
             hideOverlayTimeSeconds = normalized.hideOverlayTimeSeconds,
             fastForwardSpeed = normalized.fastForwardSpeed,
+            slowMotionDivisor = normalized.slowMotionDivisor,
             touchSwitchTilt = normalized.touchSwitchTilt
         )
     }

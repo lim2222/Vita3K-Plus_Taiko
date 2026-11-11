@@ -80,9 +80,16 @@ struct DisplayState {
     std::atomic<uint64_t> last_setframe_vblank_count = 0;
     std::map<SceUID, CallbackPtr> vblank_callbacks{};
 
-    // Overlay fast forward: the vblank thread ticks this many times per real
-    // 60 Hz frame. 1 = normal speed, 2..4 = fast forward.
+    // Overlay time scale requests. The vblank thread combines them into the
+    // effective fraction (num/den) it publishes below: fast forward makes it
+    // N/1 (more vblanks per real second), slow motion 1/N (fewer).
     std::atomic<int> fast_forward_speed{ 1 };
+    std::atomic<int> slow_motion_divisor{ 1 };
+
+    // Effective scale currently applied to the vblank period, the guest clock
+    // and the audio producer. 1/1 = normal speed.
+    std::atomic<int> time_scale_num{ 1 };
+    std::atomic<int> time_scale_den{ 1 };
 
     // Host time (microseconds, steady clock) of the last accepted
     // sceDisplaySetFrameBuf. Fast forward suspends itself while no frame has

@@ -22,12 +22,13 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <numeric>
 
 namespace {
 // Guest clock model:
-//     guest_time = scaled_elapsed + (host_now - anchor_host) * scale
-// so the guest can run at a multiple of wall time during overlay fast forward.
-// Changing the scale (or pausing) folds the elapsed segment into
+//     guest_time = scaled_elapsed + (host_now - anchor_host) * num / den
+// so the guest can run faster (fast forward) or slower (slow motion) than wall
+// time. Changing the scale (or pausing) folds the elapsed segment into
 // scaled_elapsed first, keeping the clock monotonic across speed changes.
 //
 // While an emulator pause is active (guest threads suspended, audio stream
@@ -39,7 +40,8 @@ namespace {
 struct GuestClockState {
     std::uint64_t scaled_elapsed = 0;
     std::uint64_t anchor_host = 0;
-    std::uint32_t scale = 1;
+    std::uint32_t scale_num = 1;
+    std::uint32_t scale_den = 1;
     bool paused = false;
 };
 
@@ -47,7 +49,8 @@ std::mutex rtc_clock_write_mutex;
 std::atomic<std::uint32_t> rtc_clock_seq{ 0 };
 std::atomic<std::uint64_t> rtc_scaled_elapsed{ 0 };
 std::atomic<std::uint64_t> rtc_anchor_host{ 0 };
-std::atomic<std::uint32_t> rtc_time_scale{ 1 };
+std::atomic<std::uint32_t> rtc_time_scale_num{ 1 };
+std::atomic<std::uint32_t> rtc_time_scale_den{ 1 };
 std::atomic<bool> rtc_clock_paused{ false };
 
 std::uint64_t rtc_host_now_ticks() {
@@ -58,13 +61,14 @@ std::uint64_t rtc_host_now_ticks() {
 // Publish a consistent snapshot for the lock-free readers below. All callers
 // must hold rtc_clock_write_mutex.
 void rtc_clock_publish(const std::uint64_t scaled_elapsed, const std::uint64_t anchor_host,
-    const std::uint32_t scale, const bool paused) {
+    const std::uint32_t scale_num, const std::uint32_t scale_den, const bool paused) {
     const std::uint32_t seq = rtc_clock_seq.load(std::memory_order_relaxed);
     rtc_clock_seq.store(seq + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
     rtc_scaled_elapsed.store(scaled_elapsed, std::memory_order_relaxed);
     rtc_anchor_host.store(anchor_host, std::memory_order_relaxed);
-    rtc_time_scale.store(scale, std::memory_order_relaxed);
+    rtc_time_scale_num.store(scale_num, std::memory_order_relaxed);
+    rtc_time_scale_den.store(scale_den, std::memory_order_relaxed);
     rtc_clock_paused.store(paused, std::memory_order_relaxed);
     rtc_clock_seq.store(seq + 2, std::memory_order_release);
 }
@@ -77,7 +81,8 @@ GuestClockState rtc_clock_snapshot() {
         GuestClockState state;
         state.scaled_elapsed = rtc_scaled_elapsed.load(std::memory_order_relaxed);
         state.anchor_host = rtc_anchor_host.load(std::memory_order_relaxed);
-        state.scale = rtc_time_scale.load(std::memory_order_relaxed);
+        state.scale_num = rtc_time_scale_num.load(std::memory_order_relaxed);
+        state.scale_den = rtc_time_scale_den.load(std::memory_order_relaxed);
         state.paused = rtc_clock_paused.load(std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_acquire);
         if (rtc_clock_seq.load(std::memory_order_relaxed) == before)
@@ -90,7 +95,7 @@ void rtc_clock_ensure_started() {
         return;
     const std::lock_guard<std::mutex> lock(rtc_clock_write_mutex);
     if (rtc_anchor_host.load(std::memory_order_relaxed) == 0)
-        rtc_clock_publish(0, rtc_host_now_ticks(), 1, false);
+        rtc_clock_publish(0, rtc_host_now_ticks(), 1, 1, false);
 }
 
 std::uint64_t rtc_clock_state_ticks(const GuestClockState &state) {
@@ -98,7 +103,7 @@ std::uint64_t rtc_clock_state_ticks(const GuestClockState &state) {
         return state.scaled_elapsed;
     const std::uint64_t now = rtc_host_now_ticks();
     const std::uint64_t delta = now > state.anchor_host ? now - state.anchor_host : 0;
-    return state.scaled_elapsed + delta * state.scale;
+    return state.scaled_elapsed + delta * state.scale_num / state.scale_den;
 }
 } // namespace
 
@@ -112,28 +117,35 @@ void rtc_set_clock_paused(const bool paused) {
 
     const std::uint64_t now = rtc_host_now_ticks();
     const std::uint64_t anchor = rtc_anchor_host.load(std::memory_order_relaxed);
-    const std::uint32_t scale = rtc_time_scale.load(std::memory_order_relaxed);
+    const std::uint32_t scale_num = rtc_time_scale_num.load(std::memory_order_relaxed);
+    const std::uint32_t scale_den = rtc_time_scale_den.load(std::memory_order_relaxed);
     std::uint64_t elapsed = rtc_scaled_elapsed.load(std::memory_order_relaxed);
 
     if (paused) {
         if (now > anchor)
-            elapsed += (now - anchor) * scale;
-        rtc_clock_publish(elapsed, now, scale, true);
+            elapsed += (now - anchor) * scale_num / scale_den;
+        rtc_clock_publish(elapsed, now, scale_num, scale_den, true);
     } else {
         const std::uint64_t pause_duration = now > anchor ? now - anchor : 0;
-        rtc_clock_publish(elapsed, now, scale, false);
+        rtc_clock_publish(elapsed, now, scale_num, scale_den, false);
         if (pause_duration != 0)
             LOG_INFO("[RTC] guest clock unfrozen after a {:.2f} s pause", static_cast<double>(pause_duration) / VITA_CLOCKS_PER_SEC);
     }
 }
 
-void rtc_set_time_scale(const int scale) {
-    const std::uint32_t requested = static_cast<std::uint32_t>(std::clamp(scale, 1, 8));
+void rtc_set_time_scale(const int num, const int den) {
+    const std::uint32_t requested_num = static_cast<std::uint32_t>(std::clamp(num, 1, 8));
+    const std::uint32_t requested_den = static_cast<std::uint32_t>(std::clamp(den, 1, 8));
+    const std::uint32_t divisor = std::gcd(requested_num, requested_den);
+    const std::uint32_t scale_num = requested_num / divisor;
+    const std::uint32_t scale_den = requested_den / divisor;
+
     rtc_clock_ensure_started();
     const std::lock_guard<std::mutex> lock(rtc_clock_write_mutex);
 
-    const std::uint32_t old_scale = rtc_time_scale.load(std::memory_order_relaxed);
-    if (old_scale == requested)
+    const std::uint32_t old_num = rtc_time_scale_num.load(std::memory_order_relaxed);
+    const std::uint32_t old_den = rtc_time_scale_den.load(std::memory_order_relaxed);
+    if (old_num == scale_num && old_den == scale_den)
         return;
 
     const bool paused = rtc_clock_paused.load(std::memory_order_relaxed);
@@ -141,8 +153,8 @@ void rtc_set_time_scale(const int scale) {
     const std::uint64_t anchor = rtc_anchor_host.load(std::memory_order_relaxed);
     std::uint64_t elapsed = rtc_scaled_elapsed.load(std::memory_order_relaxed);
     if (!paused && now > anchor)
-        elapsed += (now - anchor) * old_scale;
-    rtc_clock_publish(elapsed, now, requested, paused);
+        elapsed += (now - anchor) * old_num / old_den;
+    rtc_clock_publish(elapsed, now, scale_num, scale_den, paused);
 }
 
 void rtc_reset_clock_state() {
@@ -153,7 +165,7 @@ void rtc_reset_clock_state() {
     // stalls and the game can hang with no more frames presented. Start every
     // game with a clean, running clock at normal speed.
     const std::lock_guard<std::mutex> lock(rtc_clock_write_mutex);
-    rtc_clock_publish(0, rtc_host_now_ticks(), 1, false);
+    rtc_clock_publish(0, rtc_host_now_ticks(), 1, 1, false);
 }
 
 std::uint64_t rtc_guest_clock_ticks() {
@@ -165,8 +177,12 @@ bool rtc_clock_is_paused() {
     return rtc_clock_paused.load(std::memory_order_relaxed);
 }
 
-int rtc_get_time_scale() {
-    return static_cast<int>(rtc_time_scale.load(std::memory_order_relaxed));
+int rtc_get_time_scale_num() {
+    return static_cast<int>(rtc_time_scale_num.load(std::memory_order_relaxed));
+}
+
+int rtc_get_time_scale_den() {
+    return static_cast<int>(rtc_time_scale_den.load(std::memory_order_relaxed));
 }
 
 static std::uint64_t rtc_ticks_since_epoch() {

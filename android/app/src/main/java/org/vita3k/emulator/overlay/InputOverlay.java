@@ -41,15 +41,19 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   public final static int OVERLAY_MASK_TOUCH_SCREEN_SWITCH = 8;
   public final static int OVERLAY_MASK_HIDE_TOGGLE = 16;
   public final static int OVERLAY_MASK_FAST_FORWARD = 32;
+  public final static int OVERLAY_MASK_SLOW_MOTION = 64;
   private final static int OVERLAY_MASK_UTILITY =
-          OVERLAY_MASK_TOUCH_SCREEN_SWITCH | OVERLAY_MASK_HIDE_TOGGLE | OVERLAY_MASK_FAST_FORWARD;
+          OVERLAY_MASK_TOUCH_SCREEN_SWITCH | OVERLAY_MASK_HIDE_TOGGLE | OVERLAY_MASK_FAST_FORWARD
+                  | OVERLAY_MASK_SLOW_MOTION;
 
   // Seconds of inactivity before the overlay auto-hides (0 = never).
   // Pushed from OverlayConfig.hideOverlayTimeSeconds via setOverlayConfig().
   private int mHideOverlayTimeSeconds = 10;
 
-  // Fast forward is a latching tool key: one tap enables it, the next disables it.
+  // Fast forward and slow motion are latching tool keys: one tap enables one of
+  // them, the next tap disables it. They are mutually exclusive.
   private boolean mFastForwardActive = false;
+  private boolean mSlowMotionActive = false;
 
   // Adaptive overlay haptics, ported from PPSSPP's System_Vibrate(HAPTIC_VIRTUAL_KEY).
   // A global debounce stops a second finger from cancelling an in-flight rumble, and
@@ -274,10 +278,12 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     if(mOverlayMask != overlay_mask){
       mOverlayMask = overlay_mask;
       // The key is gone (menu opened, controls hidden, controller connected or the
-      // button disabled), so the latch must not keep speeding the game up with no
-      // way to turn it off.
+      // button disabled), so the latch must not keep changing the game speed with
+      // no way to turn it off.
       if ((overlay_mask & OVERLAY_MASK_FAST_FORWARD) == 0 && mFastForwardActive)
         setFastForwardActive(false);
+      if ((overlay_mask & OVERLAY_MASK_SLOW_MOTION) == 0 && mSlowMotionActive)
+        setSlowMotionActive(false);
       releaseInactiveInputs();
       invalidate();
     }
@@ -308,10 +314,12 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       invalidate();
     }
 
-    // The multiplier is part of the config, so a running fast forward must pick
-    // up the new value immediately.
+    // The multiplier is part of the config, so a running fast forward or slow
+    // motion must pick up the new value immediately.
     if (mFastForwardActive)
       applyFastForward();
+    if (mSlowMotionActive)
+      applySlowMotion();
   }
 
   private int resolveConfiguredOpacity() {
@@ -326,10 +334,13 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   }
 
   public void releaseAllInputs() {
-    // Fast forward is latched, so losing the overlay (focus loss, cancel, session
-    // teardown) must never leave the emulator running at a multiplier.
+    // Fast forward and slow motion are latched, so losing the overlay (focus
+    // loss, cancel, session teardown) must never leave the emulator running at
+    // another speed.
     if (mFastForwardActive)
       setFastForwardActive(false);
+    if (mSlowMotionActive)
+      setSlowMotionActive(false);
 
     for (InputOverlayDrawableButton button : overlayButtons) {
       if ((button.getRole() & OVERLAY_MASK_UTILITY) == 0) {
@@ -365,12 +376,28 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   /** Applies the latching fast forward key and keeps its artwork in sync. */
   private void setFastForwardActive(boolean active)
   {
+    if (active && mSlowMotionActive)
+      setSlowMotionActive(false);
     mFastForwardActive = active;
     for (InputOverlayDrawableButton button : overlayButtons)
       if (button.getLegacyId() == ButtonType.BUTTON_FAST_FORWARD)
         button.setToggled(active);
 
     applyFastForward();
+    invalidate();
+  }
+
+  /** Applies the latching slow motion key and keeps its artwork in sync. */
+  private void setSlowMotionActive(boolean active)
+  {
+    if (active && mFastForwardActive)
+      setFastForwardActive(false);
+    mSlowMotionActive = active;
+    for (InputOverlayDrawableButton button : overlayButtons)
+      if (button.getLegacyId() == ButtonType.BUTTON_SLOW_MOTION)
+        button.setToggled(active);
+
+    applySlowMotion();
     invalidate();
   }
 
@@ -381,22 +408,29 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     setFastForward(mFastForwardActive, speed);
   }
 
+  /** Pushes the current latch state and divisor to the emulator. */
+  private void applySlowMotion()
+  {
+    final int divisor = mOverlayConfig != null ? mOverlayConfig.slowMotionDivisor : 2;
+    setSlowMotion(mSlowMotionActive, divisor);
+  }
+
   private void releaseButton(InputOverlayDrawableButton button)
   {
     int legacyId = button.getLegacyId();
     button.setPressedState(false);
     if (legacyId != ButtonType.BUTTON_TOUCH_SWITCH && legacyId != ButtonType.BUTTON_TOUCH_HIDE
-            && legacyId != ButtonType.BUTTON_FAST_FORWARD)
+            && legacyId != ButtonType.BUTTON_FAST_FORWARD && legacyId != ButtonType.BUTTON_SLOW_MOTION)
       setButton(button.getControl(), false);
     button.setTrackId(-1);
   }
 
-  /** One-shot toggles (touch switch, hide toggle, fast forward) must not fire when a finger slides over them. */
+  /** One-shot toggles (touch switch, hide toggle, fast forward, slow motion) must not fire when a finger slides over them. */
   private boolean isUtilityButton(InputOverlayDrawableButton button)
   {
     final int legacyId = button.getLegacyId();
     return legacyId == ButtonType.BUTTON_TOUCH_SWITCH || legacyId == ButtonType.BUTTON_TOUCH_HIDE
-            || legacyId == ButtonType.BUTTON_FAST_FORWARD;
+            || legacyId == ButtonType.BUTTON_FAST_FORWARD || legacyId == ButtonType.BUTTON_SLOW_MOTION;
   }
 
   /** Mirrors the visibility/mask checks used when a button is first pressed. */
@@ -701,6 +735,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
             }
             else if (legacyId == ButtonType.BUTTON_FAST_FORWARD)
               setFastForwardActive(!mFastForwardActive);
+            else if (legacyId == ButtonType.BUTTON_SLOW_MOTION)
+              setSlowMotionActive(!mSlowMotionActive);
             else
               setButton(button.getControl(), true);
 
@@ -716,7 +752,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
 
             if (legacyId != ButtonType.BUTTON_TOUCH_SWITCH &&
                     legacyId != ButtonType.BUTTON_TOUCH_HIDE &&
-                    legacyId != ButtonType.BUTTON_FAST_FORWARD)
+                    legacyId != ButtonType.BUTTON_FAST_FORWARD &&
+                    legacyId != ButtonType.BUTTON_SLOW_MOTION)
               setButton(button.getControl(), false);
 
             button.setTrackId(-1);
@@ -1307,6 +1344,14 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     fastForward.setToggled(mFastForwardActive);
     overlayButtons.add(fastForward);
 
+    // Slow motion tool key: same latching behaviour, 0.5x or 0.25x.
+    final InputOverlayDrawableButton slowMotion = initializeOverlayButton(getContext(),
+            R.drawable.button_slow_motion_disabled, R.drawable.button_slow_motion_enabled,
+            ButtonType.BUTTON_SLOW_MOTION, ControlId.touch, OVERLAY_MASK_SLOW_MOTION,
+            layout, layoutBounds, mScale, mOpacity, isPortrait);
+    slowMotion.setToggled(mSlowMotionActive);
+    overlayButtons.add(slowMotion);
+
       overlayDpads.add(initializeOverlayDpad(getContext(), R.drawable.dpad_idle,
               R.drawable.dpad_up,
               R.drawable.dpad_up_left,
@@ -1357,11 +1402,14 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
         setTouchState(restored);
     }
 
-    // Fast forward is latched too, so the freshly created button must show the
-    // active artwork if a fast forward is currently running.
-    for (InputOverlayDrawableButton button : overlayButtons)
+    // Fast forward and slow motion are latched too, so the freshly created
+    // buttons must show the active artwork if one is currently running.
+    for (InputOverlayDrawableButton button : overlayButtons) {
       if (button.getLegacyId() == ButtonType.BUTTON_FAST_FORWARD)
         button.setToggled(mFastForwardActive);
+      else if (button.getLegacyId() == ButtonType.BUTTON_SLOW_MOTION)
+        button.setToggled(mSlowMotionActive);
+    }
 
     invalidate();
   }
@@ -1436,7 +1484,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     else if(legacyId == ButtonType.BUTTON_TOUCH_SWITCH
             || legacyId == ButtonType.BUTTON_PS
             || legacyId == ButtonType.BUTTON_TOUCH_HIDE
-            || legacyId == ButtonType.BUTTON_FAST_FORWARD)
+            || legacyId == ButtonType.BUTTON_FAST_FORWARD
+            || legacyId == ButtonType.BUTTON_SLOW_MOTION)
       scale = 0.11f;
 
     scale *= globalScale;
@@ -1850,6 +1899,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   public native void setButton(int button, boolean value);
   public native void setTouchState(int mode); // 0 = front, 1 = back, 2 = front + back mirrored
   public native void setFastForward(boolean enable, int speed);
+  public native void setSlowMotion(boolean enable, int divisor);
 
   private LayoutBounds resolveLayoutBounds() {
     int w = getWidth();
@@ -1933,6 +1983,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
     public static final int BUTTON_TOUCH_SWITCH = 1024;
 	public static final int TATACON = 30;
     public static final int BUTTON_FAST_FORWARD = 31;
+    public static final int BUTTON_SLOW_MOTION = 32;
   }
 
   // SDL values

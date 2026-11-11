@@ -550,6 +550,11 @@
     <string name="settings_controls_fast_forward_speed">Fast Forward Speed</string>
     <string name="settings_controls_fast_forward_speed_desc">How many times faster the emulator runs while fast forward is on. Audio speeds up with the game, so its pitch rises.</string>
     <string name="settings_controls_fast_forward_speed_value">%1$dx</string>
+    <string name="settings_controls_slow_motion">Show Slow Motion</string>
+    <string name="settings_controls_slow_motion_desc">Show the button that toggles slow motion. Tap it once to slow emulation down, tap it again to return to normal speed.</string>
+    <string name="settings_controls_slow_motion_speed">Slow Motion Speed</string>
+    <string name="settings_controls_slow_motion_speed_desc">How much slower the emulator runs while slow motion is on. Audio slows down with the game, so its pitch drops.</string>
+    <string name="settings_controls_slow_motion_speed_value">%1$sx</string>
     <string name="settings_controls_scale">Overlay Scale</string>
     <string name="settings_controls_scale_desc">Resize the touch controls to better fit your hands and screen.</string>
     <string name="settings_controls_opacity">Overlay Opacity</string>
