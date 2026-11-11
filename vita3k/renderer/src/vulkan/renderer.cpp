@@ -1470,6 +1470,58 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
             screen_renderer.swapchain_image_idx);
     }
 
+    // animation background: decode the current video frame and upload it into
+    // the background image of this swapchain image; the screen filter then
+    // draws it behind the game screen quad, filling the margins around it
+    vk::ImageView background_view = nullptr;
+    uint32_t background_width = 0;
+    uint32_t background_height = 0;
+    if (background_player.is_loaded() && screen_renderer.filter && screen_renderer.filter->supports_background()) {
+        const uint32_t image_idx = screen_renderer.swapchain_image_idx;
+        // write the background quad outside the render pass first
+        screen_renderer.filter->prepare_background();
+        background_player.update(wall_clock_now(), [&](const BackgroundPlayer::Frame &video_frame) {
+            if (video_frame.serial == screen_renderer.background_uploaded_serial[image_idx])
+                return; // this swapchain image already shows this frame
+
+            screen_renderer.background_uploaded_serial[image_idx] = video_frame.serial;
+
+            vkutil::Image &background_surface = screen_renderer.background_surface[image_idx];
+            if (video_frame.width != background_surface.width || video_frame.height != background_surface.height) {
+                // re-create the image
+                background_surface.destroy();
+                background_surface = vkutil::Image(video_frame.width, video_frame.height, vk::Format::eR8G8B8A8Unorm);
+                background_surface.init_image(vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferDst);
+            }
+
+            // copy the video frame to the staging buffer
+            memcpy(screen_renderer.background_staging_info.pMappedData, video_frame.rgba,
+                static_cast<size_t>(video_frame.width) * video_frame.height * 4);
+
+            // copy the staging buffer to the image
+            auto &cmd_buffer = screen_renderer.current_cmd_buffer;
+            background_surface.transition_to_discard(cmd_buffer, vkutil::ImageLayout::TransferDst);
+            vk::BufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = video_frame.width,
+                .bufferImageHeight = video_frame.height,
+                .imageSubresource = vkutil::color_subresource_layer,
+                .imageOffset = { 0, 0, 0 },
+                .imageExtent = { video_frame.width, video_frame.height, 1 }
+            };
+            cmd_buffer.copyBufferToImage(screen_renderer.background_staging, background_surface.image, vk::ImageLayout::eTransferDstOptimal, region);
+
+            background_surface.transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
+        });
+
+        const vkutil::Image &background_surface = screen_renderer.background_surface[image_idx];
+        if (background_surface.view) {
+            background_view = background_surface.view;
+            background_width = background_surface.width;
+            background_height = background_surface.height;
+        }
+    }
+
     if (frame.base) {
         // Check if the surface exists
         Viewport viewport;
@@ -1543,9 +1595,11 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
                 vk::DependencyFlags(), order_barrier, {}, {});
         }
 
-        screen_renderer.render(surface_handle, layout, viewport);
+        screen_renderer.render(surface_handle, layout, viewport, background_view, background_width, background_height);
     } else if (has_overlays) {
         screen_renderer.begin_default_render_pass();
+        if (background_view)
+            screen_renderer.filter->render_background(background_view, background_width, background_height);
     }
 
     if (has_overlays && screen_renderer.current_cmd_buffer) {

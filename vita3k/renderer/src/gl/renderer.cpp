@@ -701,6 +701,18 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
     display.viewport_w = vp_size.x;
     display.viewport_h = vp_size.y;
 
+    // animation background: decode the current video frame into the screen
+    // renderer's background texture; render() then draws it behind the game
+    // screen quad, filling the margins around it
+    GLuint background_texture = 0;
+    SceFVector2 background_framebuffer_size = { fb_w, fb_h };
+    if (background_player.is_loaded()) {
+        background_player.update(wall_clock_now(), [&](const BackgroundPlayer::Frame &video_frame) {
+            screen_renderer.update_background(video_frame.rgba, video_frame.width, video_frame.height, video_frame.serial);
+        });
+        background_texture = screen_renderer.get_background_texture();
+    }
+
     if (display_frame.base) {
         // Check if the surface exists
         float uvs[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -749,7 +761,8 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
 
         glBindTexture(GL_TEXTURE_2D, last_texture);
 
-        screen_renderer.render(vp_pos, vp_size, need_uv ? uvs : nullptr, static_cast<GLuint>(surface_handle), texture_size, default_fbo, screen_orientation);
+        screen_renderer.render(vp_pos, vp_size, need_uv ? uvs : nullptr, static_cast<GLuint>(surface_handle), texture_size, default_fbo, screen_orientation,
+            background_texture, &background_framebuffer_size);
     }
 
     update_overlays();

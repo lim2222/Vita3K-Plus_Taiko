@@ -51,6 +51,13 @@ bool ScreenRenderer::init(const fs::path &static_assets) {
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
     glBufferData(GL_ARRAY_BUFFER, sizeof(vertex_buffer_data), vertex_buffer_data, GL_DYNAMIC_DRAW);
 
+    // the animation background quad: the same fullscreen quad with identity
+    // uvs, but in its own buffer so the game quad's uvs can be rewritten
+    // freely without touching it
+    glGenBuffers(1, &m_background_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, m_background_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertex_buffer_data), vertex_buffer_data, GL_STATIC_DRAW);
+
     const auto &shader = enable_fxaa ? m_render_shader_fxaa : m_render_shader_nofilter;
 
     GLint posAttrib = glGetAttribLocation(*shader, "position_vertex");
@@ -84,7 +91,8 @@ bool ScreenRenderer::init(const fs::path &static_assets) {
     return true;
 }
 
-void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo, uint32_t screen_rotation) {
+void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo, uint32_t screen_rotation,
+    GLuint background_texture, const SceFVector2 *background_framebuffer_size) {
     // Code for backup and restore is taken from ImGui project ImGui_ImplSdlGL3_RenderDrawData
     // Backup GL state
     GLint last_framebuffer;
@@ -212,6 +220,72 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
         glUniform1ui(rotationLocation, screen_rotation);
     }
 
+    if (background_texture && background_framebuffer_size) {
+        // draw the animation background over the whole framebuffer: the game
+        // screen quad drawn right after covers its middle and leaves the
+        // margins (portrait lower half, landscape sides) to it
+        glViewport(0, 0, static_cast<GLsizei>(background_framebuffer_size->x), static_cast<GLsizei>(background_framebuffer_size->y));
+
+        glBindBuffer(GL_ARRAY_BUFFER, m_background_vbo);
+        glVertexAttribPointer(
+            posAttrib, // attribute index
+            3, // size
+            GL_FLOAT, // type
+            GL_FALSE, // normalized?
+            screen_vertex_size, // stride
+            reinterpret_cast<void *>(0) // array buffer offset
+        );
+        glVertexAttribPointer(
+            uvAttrib, // attribute index
+            2, // size
+            GL_FLOAT, // type
+            GL_FALSE, // normalized?
+            screen_vertex_size, // stride
+            reinterpret_cast<void *>(3 * sizeof(GLfloat)) // array buffer offset
+        );
+
+        if (enable_fxaa) {
+            const GLint invBackgroundLocation = glGetUniformLocation(*shader, "inv_frame_size");
+            glUniform2f(invBackgroundLocation, 1.0f / m_background_width, 1.0f / m_background_height);
+        }
+        if (rotationLocation >= 0) {
+            glUniform1ui(rotationLocation, 0);
+        }
+
+        glBindTexture(GL_TEXTURE_2D, background_texture);
+        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+        // restore the game screen state
+        glViewport(static_cast<GLint>(viewport_pos.x), static_cast<GLint>(viewport_pos.y), static_cast<GLsizei>(viewport_size.x),
+            static_cast<GLsizei>(viewport_size.y));
+
+        glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+        glVertexAttribPointer(
+            posAttrib, // attribute index
+            3, // size
+            GL_FLOAT, // type
+            GL_FALSE, // normalized?
+            screen_vertex_size, // stride
+            reinterpret_cast<void *>(0) // array buffer offset
+        );
+        glVertexAttribPointer(
+            uvAttrib, // attribute index
+            2, // size
+            GL_FLOAT, // type
+            GL_FALSE, // normalized?
+            screen_vertex_size, // stride
+            reinterpret_cast<void *>(3 * sizeof(GLfloat)) // array buffer offset
+        );
+
+        if (enable_fxaa) {
+            const GLint invScreenLocation = glGetUniformLocation(*shader, "inv_frame_size");
+            glUniform2f(invScreenLocation, 1 / texture_size.x, 1 / texture_size.y);
+        }
+        if (rotationLocation >= 0) {
+            glUniform1ui(rotationLocation, screen_rotation);
+        }
+    }
+
     glBindTexture(GL_TEXTURE_2D, texture);
 #ifndef __ANDROID__
     glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
@@ -250,6 +324,27 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
     glColorMask(last_color_mask[0], last_color_mask[1], last_color_mask[2], last_color_mask[3]);
 }
 
+void ScreenRenderer::update_background(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t serial) {
+    if (!rgba || !width || !height)
+        return;
+    if (m_background_texture && serial == m_background_serial && width == m_background_width && height == m_background_height)
+        return; // the texture already contains this frame
+
+    if (!m_background_texture)
+        glGenTextures(1, &m_background_texture);
+
+    glBindTexture(GL_TEXTURE_2D, m_background_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+
+    m_background_serial = serial;
+    m_background_width = width;
+    m_background_height = height;
+}
+
 void ScreenRenderer::destroy() {
     glDeleteBuffers(1, &m_vbo);
     m_vbo = 0;
@@ -259,6 +354,15 @@ void ScreenRenderer::destroy() {
 
     glDeleteTextures(1, &m_screen_texture);
     m_screen_texture = 0;
+
+    glDeleteTextures(1, &m_background_texture);
+    m_background_texture = 0;
+    m_background_serial = 0;
+    m_background_width = 0;
+    m_background_height = 0;
+
+    glDeleteBuffers(1, &m_background_vbo);
+    m_background_vbo = 0;
 
     m_render_shader_nofilter.reset();
     m_render_shader_fxaa.reset();

@@ -38,6 +38,17 @@ public:
     virtual void on_resize() {};
     virtual void render(bool is_pre_renderpass, vk::ImageView src_img, vk::ImageLayout src_layout, const Viewport &viewport) = 0;
     virtual std::string_view get_name() = 0;
+    // can this filter also draw the animation background quad behind the game screen?
+    virtual bool supports_background() {
+        return false;
+    }
+    // write the animation background vertex data, if any. Called once per
+    // frame outside the render pass, before render_background is recorded
+    // inside it. No-op by default.
+    virtual void prepare_background() {}
+    // draw the animation background as the first quad of the render pass currently
+    // being recorded, before the game screen draws on top of it. No-op by default.
+    virtual void render_background(vk::ImageView background_img, uint32_t background_width, uint32_t background_height) {}
     // do we need the render pass not to clear the swapchain content ?
     virtual bool need_post_processing_render_pass() {
         return false;
@@ -54,6 +65,11 @@ private:
 
     vkutil::Buffer vao;
     std::vector<std::array<float, 4>> last_uvs;
+
+    // fullscreen quad of the animation background with identity uvs; it never
+    // changes, unlike the game quad whose uvs are rewritten per frame
+    vkutil::Buffer background_vao;
+    bool background_vao_written = false;
 
     vk::ShaderModule vertex_shader;
     vk::ShaderModule fragment_shader;
@@ -74,6 +90,11 @@ public:
     ~SinglePassScreenFilter();
     void init() override;
     void render(bool is_pre_renderpass, vk::ImageView src_img, vk::ImageLayout src_layout, const Viewport &viewport) override;
+    bool supports_background() override {
+        return true;
+    }
+    void prepare_background() override;
+    void render_background(vk::ImageView background_img, uint32_t background_width, uint32_t background_height) override;
 };
 
 class NearestScreenFilter : public SinglePassScreenFilter {

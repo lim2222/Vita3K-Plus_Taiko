@@ -114,6 +114,7 @@ public class Emulator extends SDLActivity
     private int lastTextInputType;
     private boolean hasLastTextInputState;
     private ImagePathResultCallback pendingImagePathCallback;
+    private String[] pendingImagePickerMimeTypes;
 
     public static Intent createLaunchIntent(Context context, String titleId, String gameTitle) {
         Intent intent = new Intent(context, Emulator.class);
@@ -135,6 +136,7 @@ public class Emulator extends SDLActivity
     public interface OnConfigChangeListener {
         void onScreenOrientationChanged(int orientation);
         void onPortraitYOffsetChanged(float offset);
+        void onAnimationBackgroundChanged(String path, boolean enabled);
         void onRendererConfigChanged();
     }
 
@@ -153,6 +155,12 @@ public class Emulator extends SDLActivity
     public static void notifyPortraitYOffsetChanged(float offset) {
         if (sConfigChangeListener != null) {
             sConfigChangeListener.onPortraitYOffsetChanged(offset);
+        }
+    }
+
+    public static void notifyAnimationBackgroundChanged(String path, boolean enabled) {
+        if (sConfigChangeListener != null) {
+            sConfigChangeListener.onAnimationBackgroundChanged(path, enabled);
         }
     }
 
@@ -284,6 +292,11 @@ public class Emulator extends SDLActivity
             @Override
             public void onPortraitYOffsetChanged(float offset) {
                 applyPortraitYOffset(offset);
+            }
+
+            @Override
+            public void onAnimationBackgroundChanged(String path, boolean enabled) {
+                applyAnimationBackground(path, enabled);
             }
 
             @Override
@@ -1259,6 +1272,18 @@ public class Emulator extends SDLActivity
 
     public void requestImagePath(ImagePathResultCallback onResult) {
         pendingImagePathCallback = onResult;
+        pendingImagePickerMimeTypes = new String[]{"image/*"};
+        if (!StorageAccess.hasStorageAccess(this)) {
+            requestFolderAccess();
+            return;
+        }
+
+        launchImagePicker();
+    }
+
+    public void requestVideoPath(ImagePathResultCallback onResult) {
+        pendingImagePathCallback = onResult;
+        pendingImagePickerMimeTypes = new String[]{"video/*"};
         if (!StorageAccess.hasStorageAccess(this)) {
             requestFolderAccess();
             return;
@@ -1268,16 +1293,21 @@ public class Emulator extends SDLActivity
     }
 
     private void launchImagePicker() {
+        final String[] mimeTypes = pendingImagePickerMimeTypes != null
+                ? pendingImagePickerMimeTypes
+                : new String[]{"image/*"};
+        final boolean isVideoPicker = mimeTypes.length > 0 && "video/*".equals(mimeTypes[0]);
         startActivityForResult(
                 Intent.createChooser(
-                        StorageAccess.createFilePickerIntent(new String[]{"image/*"}),
-                        "Choose an image"),
+                        StorageAccess.createFilePickerIntent(mimeTypes),
+                        isVideoPicker ? "Choose a video" : "Choose an image"),
                 FILE_DIALOG_CODE);
     }
 
     private void dispatchPendingImagePath(String path) {
         ImagePathResultCallback callback = pendingImagePathCallback;
         pendingImagePathCallback = null;
+        pendingImagePickerMimeTypes = null;
         if (callback != null) {
             callback.onResult(path);
         }
@@ -1299,6 +1329,8 @@ public class Emulator extends SDLActivity
     private native void setNativeDisplayRotation(int rotation);
 
     private native void setPortraitYOffset(float offset);
+
+    private native void setAnimationBackground(String path, boolean enable);
 
     public native void filedialogReturn(String result_path);
 
@@ -1956,6 +1988,14 @@ public class Emulator extends SDLActivity
     public void applyPortraitYOffset(float offset) {
         try {
             setPortraitYOffset(offset);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    @Keep
+    public void applyAnimationBackground(String path, boolean enabled) {
+        try {
+            setAnimationBackground(path != null ? path : "", enabled);
         } catch (Throwable ignored) {
         }
     }

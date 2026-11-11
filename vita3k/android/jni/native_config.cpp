@@ -106,6 +106,8 @@ struct EmulatorConfigFields {
     jfieldID fullscreenHdResPixelPerfect = nullptr;
     jfieldID screenOrientation = nullptr;
     jfieldID portraitYOffset = nullptr;
+    jfieldID animationBackground = nullptr;
+    jfieldID backgroundVideo = nullptr;
     jfieldID fileLoadingDelay = nullptr;
     jfieldID showLiveAreaScreen = nullptr;
     jfieldID showCompileShaders = nullptr;
@@ -196,6 +198,8 @@ EmulatorConfigFields resolve_config_fields(JNIEnv *env) {
     fields.fullscreenHdResPixelPerfect = env->GetFieldID(fields.cls, "fullscreenHdResPixelPerfect", "Z");
     fields.screenOrientation = env->GetFieldID(fields.cls, "screenOrientation", "I");
     fields.portraitYOffset = env->GetFieldID(fields.cls, "portraitYOffset", "F");
+    fields.animationBackground = env->GetFieldID(fields.cls, "animationBackground", "Z");
+    fields.backgroundVideo = env->GetFieldID(fields.cls, "backgroundVideo", "Ljava/lang/String;");
     fields.fileLoadingDelay = env->GetFieldID(fields.cls, "fileLoadingDelay", "I");
     fields.showLiveAreaScreen = env->GetFieldID(fields.cls, "showLiveAreaScreen", "Z");
     fields.showCompileShaders = env->GetFieldID(fields.cls, "showCompileShaders", "Z");
@@ -414,6 +418,9 @@ void fill_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
     env->SetBooleanField(obj, fields.fullscreenHdResPixelPerfect, current_config.fullscreen_hd_res_pixel_perfect);
     env->SetIntField(obj, fields.screenOrientation, static_cast<jint>(current_config.screen_orientation));
     env->SetFloatField(obj, fields.portraitYOffset, current_config.portrait_y_offset);
+    env->SetBooleanField(obj, fields.animationBackground, current_config.animation_background);
+    jstring background_video = env->NewStringUTF(current_config.background_video.c_str());
+    env->SetObjectField(obj, fields.backgroundVideo, background_video);
     env->SetIntField(obj, fields.fileLoadingDelay, static_cast<jint>(current_config.file_loading_delay));
     env->SetBooleanField(obj, fields.showLiveAreaScreen, config.show_live_area_screen);
     env->SetBooleanField(obj, fields.showCompileShaders, config.show_compile_shaders);
@@ -569,6 +576,9 @@ void read_config_object(JNIEnv *env, jobject obj, const EmulatorConfigFields &fi
     current_config.fullscreen_hd_res_pixel_perfect = env->GetBooleanField(obj, fields.fullscreenHdResPixelPerfect) != JNI_FALSE;
     current_config.screen_orientation = static_cast<int>(env->GetIntField(obj, fields.screenOrientation));
     current_config.portrait_y_offset = env->GetFloatField(obj, fields.portraitYOffset);
+    current_config.animation_background = env->GetBooleanField(obj, fields.animationBackground);
+    if (auto *background_video = reinterpret_cast<jstring>(env->GetObjectField(obj, fields.backgroundVideo)))
+        current_config.background_video = jstring_to_string(env, background_video);
     current_config.file_loading_delay = static_cast<int>(env->GetIntField(obj, fields.fileLoadingDelay));
     config.show_live_area_screen = env->GetBooleanField(obj, fields.showLiveAreaScreen) != JNI_FALSE;
     config.show_compile_shaders = env->GetBooleanField(obj, fields.showCompileShaders) != JNI_FALSE;

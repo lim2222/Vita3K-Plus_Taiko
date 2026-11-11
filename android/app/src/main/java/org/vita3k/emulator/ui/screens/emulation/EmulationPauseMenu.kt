@@ -994,6 +994,13 @@ private fun EmbeddedSettingsTab(
                     }
                 }
             },
+            onPickBackgroundVideo = {
+                activity.requestVideoPath { path ->
+                    if (path != null) {
+                        activeViewModel.setBackgroundVideo(path)
+                    }
+                }
+            },
             onRequestRemoveCustomDriver = { _ -> },
             isPerApp = activeScope == PauseSettingsScope.CustomConfig,
             showCustomDriverManagement = false,

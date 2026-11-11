@@ -435,6 +435,32 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun setBackgroundVideo(path: String) {
+        viewModelScope.launch {
+            try {
+                if (path.isNullOrBlank()) {
+                    operationResult = SettingsOperationResult(
+                        str(R.string.settings_background_video_resolve_failed),
+                        true
+                    )
+                    return@launch
+                }
+
+                update {
+                    animationBackground = true
+                    backgroundVideo = path
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                operationResult = SettingsOperationResult(
+                    str(R.string.install_error_generic, e.message ?: ""),
+                    true
+                )
+            }
+        }
+    }
+
     fun dismissOperationResult() {
         operationResult = null
     }

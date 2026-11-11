@@ -39,6 +39,7 @@ add_library(
 
 	src/batch.cpp
 	src/creation.cpp
+	src/background_player.cpp
 	src/renderer.cpp
 	src/scene.cpp
 	src/shaders.cpp

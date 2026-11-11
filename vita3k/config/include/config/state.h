@@ -95,6 +95,8 @@ struct Config {
         int screen_orientation = 0;  // 0=Auto, 1=Portrait, 2=Landscape
         int file_loading_delay = 0;
         float portrait_y_offset = 0.0f;
+        bool animation_background = false;
+        std::string background_video;
         bool psn_signed_in = false;
         int sys_button = static_cast<int>(SCE_SYSTEM_PARAM_ENTER_BUTTON_CROSS);
         int sys_lang = static_cast<int>(SCE_SYSTEM_PARAM_LANG_ENGLISH_US);

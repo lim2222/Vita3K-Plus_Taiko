@@ -415,6 +415,16 @@ void ScreenRenderer::cleanup() {
         vita_surface_staging = nullptr;
     }
 
+    for (auto &img : background_surface)
+        img.destroy();
+    background_surface.clear();
+    background_uploaded_serial.clear();
+
+    if (background_staging) {
+        state.allocator.destroyBuffer(background_staging, background_staging_alloc);
+        background_staging = nullptr;
+    }
+
     for (vk::Framebuffer fb : swapchain_framebuffers)
         state.device.destroy(fb);
     swapchain_framebuffers.clear();
@@ -545,7 +555,8 @@ void ScreenRenderer::begin_default_render_pass() {
     current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
 }
 
-void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport) {
+void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport,
+    vk::ImageView background_view, uint32_t background_width, uint32_t background_height) {
     if (swapchain_image_idx == ~0 && !acquire_swapchain_image())
         return;
 
@@ -565,6 +576,11 @@ void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, co
     };
     pass_info.setClearValues(clear_color);
     current_cmd_buffer.beginRenderPass(pass_info, vk::SubpassContents::eInline);
+
+    // the animation background draws first, the game screen covers it in the
+    // middle and leaves the margins to it
+    if (background_view)
+        filter->render_background(background_view, background_width, background_height);
 
     filter->render(false, image_view, layout, viewport);
 
@@ -752,6 +768,17 @@ void ScreenRenderer::create_surface_image() {
         .sharingMode = vk::SharingMode::eExclusive
     };
     std::tie(vita_surface_staging, vita_surface_staging_alloc) = state.allocator.createBuffer(buffer_info, vkutil::vma_mapped_alloc, vita_surface_staging_info);
+
+    background_surface.resize(swapchain_size);
+    background_uploaded_serial.assign(swapchain_size, 0);
+
+    // same budget the BackgroundPlayer scales its output to
+    vk::BufferCreateInfo background_buffer_info{
+        .size = 1024 * 720 * sizeof(uint32_t),
+        .usage = vk::BufferUsageFlagBits::eTransferSrc,
+        .sharingMode = vk::SharingMode::eExclusive
+    };
+    std::tie(background_staging, background_staging_alloc) = state.allocator.createBuffer(background_buffer_info, vkutil::vma_mapped_alloc, background_staging_info);
 }
 
 bool ScreenRenderer::ensure_swapchain() {

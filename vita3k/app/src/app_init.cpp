@@ -681,6 +681,10 @@ void apply_renderer_config(EmuEnvState &emuenv) {
     r.stretch_hd_pixel_perfect(cc.fullscreen_hd_res_pixel_perfect);
     r.set_screen_orientation(cc.screen_orientation);
     r.set_portrait_y_offset(cc.portrait_y_offset);
+    if (cc.animation_background && !cc.background_video.empty())
+        r.background_player.open(cc.background_video);
+    else
+        r.background_player.close();
     r.set_async_compilation(cc.async_pipeline_compilation);
     r.get_texture_cache()->set_replacement_state(cc.import_textures, cc.export_textures, cc.export_as_png);
 #ifdef __ANDROID__
@@ -773,6 +777,10 @@ void apply_runtime_settings(EmuEnvState &emuenv) {
     r.stretch_hd_pixel_perfect(cc.fullscreen_hd_res_pixel_perfect);
     r.set_screen_orientation(cc.screen_orientation);
     r.set_portrait_y_offset(cc.portrait_y_offset);
+    if (cc.animation_background && !cc.background_video.empty())
+        r.background_player.open(cc.background_video);
+    else
+        r.background_player.close();
     r.set_async_compilation(cc.async_pipeline_compilation);
     r.get_texture_cache()->set_replacement_state(cc.import_textures, cc.export_textures, cc.export_as_png);
 #ifdef __ANDROID__

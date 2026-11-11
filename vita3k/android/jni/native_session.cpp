@@ -116,6 +116,29 @@ Java_org_vita3k_emulator_Emulator_setPortraitYOffset(JNIEnv *, jobject, jfloat o
 }
 
 JNIEXPORT void JNICALL
+Java_org_vita3k_emulator_Emulator_setAnimationBackground(JNIEnv *env, jobject, jstring path, jboolean enable) {
+    auto *emuenv = get_emuenv();
+    if (!emuenv || !emuenv->renderer)
+        return;
+
+    if (!enable) {
+        emuenv->renderer->background_player.close();
+        return;
+    }
+
+    if (!path)
+        return;
+    const char *path_str = env->GetStringUTFChars(path, nullptr);
+    if (!path_str)
+        return;
+    const std::string video_path(path_str);
+    env->ReleaseStringUTFChars(path, path_str);
+    if (video_path.empty())
+        return;
+    emuenv->renderer->background_player.open(video_path);
+}
+
+JNIEXPORT void JNICALL
 Java_org_vita3k_emulator_Emulator_applyRendererConfigNative(JNIEnv *, jobject) {
     auto *emuenv = get_emuenv();
     if (!emuenv || !emuenv->renderer)
@@ -131,6 +154,10 @@ Java_org_vita3k_emulator_Emulator_applyRendererConfigNative(JNIEnv *, jobject) {
     r.stretch_hd_pixel_perfect(cc.fullscreen_hd_res_pixel_perfect);
     r.set_screen_orientation(cc.screen_orientation);
     r.set_portrait_y_offset(cc.portrait_y_offset);
+    if (cc.animation_background && !cc.background_video.empty())
+        r.background_player.open(cc.background_video);
+    else
+        r.background_player.close();
     r.set_device_native_rotation(emuenv->motion.device_native_rotation);
     r.set_async_compilation(cc.async_pipeline_compilation);
     r.get_texture_cache()->set_replacement_state(cc.import_textures, cc.export_textures, cc.export_as_png);

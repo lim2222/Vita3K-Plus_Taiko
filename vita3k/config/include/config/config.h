@@ -207,6 +207,8 @@ using PhysicalKeyCode = input::PhysicalKeyCode;
     code(bool, "disable-motion", false, disable_motion)                                                 \
     code(float, "controller-analog-multiplier", 1.0f, controller_analog_multiplier)                     \
     code(float, "portrait-y-offset", 0.0f, portrait_y_offset)                                              \
+    code(bool, "animation-background", false, animation_background)                                      \
+    code(std::string, "background-video", std::string{}, background_video)                               \
     code(bool, "controller-swap-triggers", false, controller_swap_triggers)                             \
     CONFIG_KEYBOARD(code)                                                                               \
     code(std::string, "user-id", std::string{}, user_id)                                                \

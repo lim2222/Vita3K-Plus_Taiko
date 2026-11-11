@@ -47,6 +47,8 @@ class EmulatorConfig {
     // Display
     @JvmField var screenOrientation: Int = 0  // 0=Auto, 1=Portrait, 2=Landscape
     @JvmField var portraitYOffset: Float = 0.0f
+    @JvmField var animationBackground: Boolean = false
+    @JvmField var backgroundVideo: String = ""
 
     // Camera
     @JvmField var frontCameraType: Int = 2
@@ -137,6 +139,8 @@ class EmulatorConfig {
         config.controllerAxisBinds = controllerAxisBinds.copyOf()
         config.screenOrientation = screenOrientation
         config.portraitYOffset = portraitYOffset
+        config.animationBackground = animationBackground
+        config.backgroundVideo = backgroundVideo
 
         config.frontCameraType = frontCameraType
         config.frontCameraId = frontCameraId
@@ -222,6 +226,8 @@ class EmulatorConfig {
             controllerAxisBinds.contentEquals(other.controllerAxisBinds) &&
             screenOrientation == other.screenOrientation &&
             portraitYOffset == other.portraitYOffset &&
+            animationBackground == other.animationBackground &&
+            backgroundVideo == other.backgroundVideo &&
             frontCameraType == other.frontCameraType &&
             frontCameraId == other.frontCameraId &&
             frontCameraImage == other.frontCameraImage &&
@@ -303,6 +309,8 @@ class EmulatorConfig {
         result = 31 * result + controllerAxisBinds.contentHashCode()
         result = 31 * result + screenOrientation
         result = 31 * result + portraitYOffset.hashCode()
+        result = 31 * result + animationBackground.hashCode()
+        result = 31 * result + backgroundVideo.hashCode()
         result = 31 * result + frontCameraType
         result = 31 * result + frontCameraId.hashCode()
         result = 31 * result + frontCameraImage.hashCode()

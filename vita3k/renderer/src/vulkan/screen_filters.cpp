@@ -67,10 +67,12 @@ void SinglePassScreenFilter::create_layout_sync() {
 
     vk::DescriptorPoolSize pool_size{
         .type = vk::DescriptorType::eCombinedImageSampler,
-        .descriptorCount = screen.swapchain_size
+        // one set for the game screen and one for the animation background,
+        // per swapchain image
+        .descriptorCount = screen.swapchain_size * 2
     };
     vk::DescriptorPoolCreateInfo pool_info{
-        .maxSets = screen.swapchain_size,
+        .maxSets = screen.swapchain_size * 2,
     };
     pool_info.setPoolSizes(pool_size);
     descriptor_pool = device.createDescriptorPool(pool_info);
@@ -78,7 +80,7 @@ void SinglePassScreenFilter::create_layout_sync() {
     vk::DescriptorSetAllocateInfo descr_set_info{
         .descriptorPool = descriptor_pool,
     };
-    std::vector<vk::DescriptorSetLayout> descr_set_layouts(screen.swapchain_size, descriptor_set_layout);
+    std::vector<vk::DescriptorSetLayout> descr_set_layouts(screen.swapchain_size * 2, descriptor_set_layout);
     descr_set_info.setSetLayouts(descr_set_layouts);
     descriptor_sets = device.allocateDescriptorSets(descr_set_info);
 
@@ -98,6 +100,22 @@ void SinglePassScreenFilter::create_layout_sync() {
     vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
     if (!vao.mapped_data)
         LOG_ERROR("screen filter vao is not host-mappable on this device; falling back to updateBuffer");
+
+    // create the animation background quad: a single fullscreen quad with
+    // identity uvs, shared by all swapchain images and never rewritten
+    background_vao.size = sizeof(screen_vertices_t);
+    background_vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
+    background_vao_written = false;
+    if (background_vao.mapped_data) {
+        const screen_vertices_t background_quad = {
+            { { 1.f, -1.f, 0.0f }, { 1.f, 0.f } },
+            { { -1.f, -1.f, 0.0f }, { 0.f, 0.f } },
+            { { 1.f, 1.f, 0.0f }, { 1.f, 1.f } },
+            { { -1.f, 1.f, 0.0f }, { 0.f, 1.f } },
+        };
+        memcpy(background_vao.mapped_data, &background_quad, sizeof(background_quad));
+        background_vao_written = true;
+    }
 
     // create and zero-fill uvs
     last_uvs.resize(screen.swapchain_size);
@@ -264,7 +282,7 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
             .imageLayout = src_layout,
         };
         vk::WriteDescriptorSet write_descr{
-            .dstSet = descriptor_sets[screen.swapchain_image_idx],
+            .dstSet = descriptor_sets[screen.swapchain_image_idx * 2 + 1],
             .dstBinding = 0,
             .dstArrayElement = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -318,9 +336,81 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
         screen.current_cmd_buffer.bindVertexBuffers(0, vao.buffer, offset);
 
         screen.current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx], {});
+        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx * 2 + 1], {});
 
         std::array<float, 2> inv_size = { 1.f / viewport.texture_width, 1.f / viewport.texture_height };
+        screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(float), inv_size.data());
+
+        screen.current_cmd_buffer.draw(4, 1, 0, 0);
+    }
+}
+
+void SinglePassScreenFilter::prepare_background() {
+    // the background quad never changes, write it once. This runs outside the
+    // render pass: vkCmdUpdateBuffer (the fallback for buffers that are not
+    // host-mappable) is not allowed inside one.
+    if (background_vao_written)
+        return;
+
+    const screen_vertices_t background_quad = {
+        { { 1.f, -1.f, 0.0f }, { 1.f, 0.f } },
+        { { -1.f, -1.f, 0.0f }, { 0.f, 0.f } },
+        { { 1.f, 1.f, 0.0f }, { 1.f, 1.f } },
+        { { -1.f, 1.f, 0.0f }, { 0.f, 1.f } },
+    };
+    if (background_vao.mapped_data)
+        memcpy(background_vao.mapped_data, &background_quad, sizeof(background_quad));
+    else
+        screen.current_cmd_buffer.updateBuffer(background_vao.buffer, 0, sizeof(background_quad), &background_quad);
+    background_vao_written = true;
+}
+
+void SinglePassScreenFilter::render_background(vk::ImageView background_img, uint32_t background_width, uint32_t background_height) {
+    if (!background_vao_written)
+        return; // not prepared (outside the render pass) yet, skip this frame
+
+    {
+        // update the background descriptor set of this swapchain image
+        vk::DescriptorImageInfo descr_image_info{
+            .sampler = sampler,
+            .imageView = background_img,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        };
+        vk::WriteDescriptorSet write_descr{
+            .dstSet = descriptor_sets[screen.swapchain_image_idx * 2],
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        };
+        write_descr.setImageInfo(descr_image_info);
+        screen.state.device.updateDescriptorSets(write_descr, {});
+    }
+
+    {
+        // the background covers the whole swapchain, the game viewport is
+        // applied back by the game quad draw that follows
+        vk::Rect2D vk_scissor{
+            .offset = { 0, 0 },
+            .extent = screen.extent
+        };
+        screen.current_cmd_buffer.setScissor(0, vk_scissor);
+        vk::Viewport vk_viewport{
+            .x = 0.0f,
+            .y = 0.0f,
+            .width = static_cast<float>(screen.extent.width),
+            .height = static_cast<float>(screen.extent.height),
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f
+        };
+        screen.current_cmd_buffer.setViewport(0, vk_viewport);
+
+        const vk::DeviceSize offset = 0;
+        screen.current_cmd_buffer.bindVertexBuffers(0, background_vao.buffer, offset);
+
+        screen.current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx * 2], {});
+
+        std::array<float, 2> inv_size = { 1.f / background_width, 1.f / background_height };
         screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(float), inv_size.data());
 
         screen.current_cmd_buffer.draw(4, 1, 0, 0);

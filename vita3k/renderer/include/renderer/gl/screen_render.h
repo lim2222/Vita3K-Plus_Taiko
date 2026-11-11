@@ -29,7 +29,8 @@ public:
     ~ScreenRenderer();
 
     bool init(const fs::path &static_assets);
-    void render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo = 0, uint32_t screen_rotation = 0);
+    void render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo = 0, uint32_t screen_rotation = 0,
+        GLuint background_texture = 0, const SceFVector2 *background_framebuffer_size = nullptr);
 
     void destroy();
 
@@ -37,6 +38,15 @@ public:
     // For homebrew that does not use GXM
     GLuint get_resident_texture() const {
         return m_screen_texture;
+    }
+
+    // Upload the current animation background frame. Call on the render
+    // thread, before render(). Frames are deduplicated on `serial`.
+    void update_background(const uint8_t *rgba, uint32_t width, uint32_t height, uint64_t serial);
+
+    // 0 when no background frame has been uploaded yet
+    GLuint get_background_texture() const {
+        return m_background_texture;
     }
 
     bool enable_fxaa;
@@ -57,6 +67,15 @@ private:
     SharedGLObject m_render_shader_nofilter;
     SharedGLObject m_render_shader_fxaa;
     GLuint m_screen_texture{ 0 };
+
+    // animation background (muted looping video behind the game screen):
+    // lazily created texture with its own identity-uv quad buffer, plus the
+    // serial of the frame currently in the texture
+    GLuint m_background_texture{ 0 };
+    GLuint m_background_vbo{ 0 };
+    uint64_t m_background_serial{ 0 };
+    uint32_t m_background_width{ 0 };
+    uint32_t m_background_height{ 0 };
 
     float last_uvs[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
 };

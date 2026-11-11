@@ -73,6 +73,16 @@ public:
     vma::AllocationInfo vita_surface_staging_info;
     vk::Buffer vita_surface_staging;
 
+    // animation background (muted looping video behind the game screen), one
+    // image per swapchain image like vita_surface, with its own staging buffer
+    std::vector<vkutil::Image> background_surface;
+    vma::Allocation background_staging_alloc;
+    vma::AllocationInfo background_staging_info;
+    vk::Buffer background_staging;
+    // content serial last uploaded into each swapchain image, so the upload is
+    // skipped while the video shows the same frame on that image
+    std::vector<uint64_t> background_uploaded_serial;
+
     vk::CommandBuffer current_cmd_buffer;
 
     // these are used by the gui
@@ -105,7 +115,8 @@ public:
 
     bool acquire_swapchain_image();
     void begin_default_render_pass();
-    void render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport);
+    void render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport,
+        vk::ImageView background_view = nullptr, uint32_t background_width = 0, uint32_t background_height = 0);
     void swap_window();
     void set_filter(const std::string_view &filter);
 

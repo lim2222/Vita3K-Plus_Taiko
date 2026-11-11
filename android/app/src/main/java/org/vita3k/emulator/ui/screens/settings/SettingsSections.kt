@@ -219,6 +219,7 @@ internal fun SettingsCategoryBody(
     onInstallCustomDriver: () -> Unit,
     onDownloadCustomDriver: () -> Unit,
     onPickCameraImage: (Boolean) -> Unit,
+    onPickBackgroundVideo: () -> Unit,
     onRequestRemoveCustomDriver: (String) -> Unit,
     isPerApp: Boolean,
     showCustomDriverManagement: Boolean = true,
@@ -318,6 +319,7 @@ internal fun SettingsCategoryBody(
             allowStorageFolderManagement = allowStorageFolderManagement,
             allowClearAllCustomConfigs = allowClearAllCustomConfigs,
             onClearAllCustomConfigs = onClearAllCustomConfigs,
+            onPickBackgroundVideo = onPickBackgroundVideo,
             onUpdate = onUpdate,
             onShowHelp = onShowHelp
         )
@@ -1592,6 +1594,7 @@ private fun EmulatorSettingsSection(
     allowStorageFolderManagement: Boolean,
     allowClearAllCustomConfigs: Boolean,
     onClearAllCustomConfigs: () -> Unit,
+    onPickBackgroundVideo: () -> Unit,
     onUpdate: (EmulatorConfig.() -> Unit) -> Unit,
     onShowHelp: (SettingsHelpEntry) -> Unit
 ) {
@@ -1830,6 +1833,30 @@ private fun EmulatorSettingsSection(
             ),
             onShowHelp = onShowHelp
         )
+        SettingsToggleRow(
+            title = stringResource(R.string.settings_emulator_animation_background),
+            checked = cfg.animationBackground,
+            onCheckedChange = { onUpdate { animationBackground = it } },
+            help = SettingsHelpEntry(
+                title = stringResource(R.string.settings_emulator_animation_background),
+                body = stringResource(R.string.settings_emulator_animation_background_desc)
+            ),
+            onShowHelp = onShowHelp
+        )
+        if (cfg.animationBackground) {
+            SettingsActionRow(
+                title = stringResource(R.string.settings_emulator_background_video),
+                value = cfg.backgroundVideo.substringAfterLast('/').ifBlank {
+                    stringResource(R.string.settings_emulator_background_video_none)
+                },
+                onClick = onPickBackgroundVideo,
+                help = SettingsHelpEntry(
+                    title = stringResource(R.string.settings_emulator_background_video),
+                    body = stringResource(R.string.settings_emulator_background_video_desc)
+                ),
+                onShowHelp = onShowHelp
+            )
+        }
     }
 
     if (!isPerApp) {

@@ -69,6 +69,7 @@ private val CUSTOM_DRIVER_MIME_TYPES = arrayOf(
     "application/octet-stream"
 )
 private val IMAGE_MIME_TYPES = arrayOf("image/*")
+private val VIDEO_MIME_TYPES = arrayOf("video/*")
 
 private fun formatRestartRequiredSettings(
     context: android.content.Context,
@@ -116,6 +117,20 @@ fun SettingsRoute(
         if (prevPortraitYOffset != viewModel.config.portraitYOffset) {
             prevPortraitYOffset = viewModel.config.portraitYOffset
             org.vita3k.emulator.Emulator.notifyPortraitYOffsetChanged(viewModel.config.portraitYOffset)
+        }
+    }
+
+    // Track animation background changes and notify the running renderer immediately (no restart)
+    var prevAnimationBackground by remember { mutableStateOf(viewModel.config.animationBackground) }
+    var prevBackgroundVideo by remember { mutableStateOf(viewModel.config.backgroundVideo) }
+    LaunchedEffect(viewModel.config.animationBackground, viewModel.config.backgroundVideo) {
+        if (prevAnimationBackground != viewModel.config.animationBackground || prevBackgroundVideo != viewModel.config.backgroundVideo) {
+            prevAnimationBackground = viewModel.config.animationBackground
+            prevBackgroundVideo = viewModel.config.backgroundVideo
+            org.vita3k.emulator.Emulator.notifyAnimationBackgroundChanged(
+                viewModel.config.backgroundVideo,
+                viewModel.config.animationBackground
+            )
         }
     }
     var originalOverlayState by remember(titleId) { mutableStateOf(overlayState) }
@@ -166,6 +181,15 @@ fun SettingsRoute(
             pendingCameraImageTarget = null
             if (target != null && path != null) {
                 viewModel.setCameraImage(target, path)
+            }
+        }
+    }
+
+    fun pickBackgroundVideo() {
+        val activity = context as? MainActivity ?: return
+        activity.requestFilePath(VIDEO_MIME_TYPES) { path ->
+            if (path != null) {
+                viewModel.setBackgroundVideo(path)
             }
         }
     }
@@ -384,6 +408,7 @@ fun SettingsRoute(
                     onInstallCustomDriver = ::requestCustomDriverInstall,
                     onDownloadCustomDriver = { openUrl(CUSTOM_DRIVER_DOWNLOAD_URL) },
                     onPickCameraImage = ::pickCameraImage,
+                    onPickBackgroundVideo = ::pickBackgroundVideo,
                     onRequestRemoveCustomDriver = { pendingCustomDriverRemoval = it },
                     onClearAllCustomConfigs = { showClearAllCustomConfigsDialog = true },
                     onOverlayConfigChange = { updated ->
@@ -655,6 +680,7 @@ private fun SettingsContentPane(
     onInstallCustomDriver: () -> Unit,
     onDownloadCustomDriver: () -> Unit,
     onPickCameraImage: (Boolean) -> Unit,
+    onPickBackgroundVideo: () -> Unit,
     onRequestRemoveCustomDriver: (String) -> Unit,
     onClearAllCustomConfigs: () -> Unit,
     onOverlayConfigChange: (OverlayConfig) -> Unit,
@@ -711,6 +737,7 @@ private fun SettingsContentPane(
                 onInstallCustomDriver = onInstallCustomDriver,
                 onDownloadCustomDriver = onDownloadCustomDriver,
                 onPickCameraImage = onPickCameraImage,
+                onPickBackgroundVideo = onPickBackgroundVideo,
                 onRequestRemoveCustomDriver = onRequestRemoveCustomDriver,
                 isPerApp = isPerApp,
                 showCustomDriverManagement = viewModel.showCustomDriverOptions,

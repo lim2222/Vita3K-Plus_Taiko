@@ -18,6 +18,7 @@
 #pragma once
 
 #include <features/state.h>
+#include <renderer/background_player.h>
 #include <renderer/commands.h>
 #include <renderer/frame_host.h>
 #include <renderer/types.h>
@@ -180,6 +181,9 @@ struct State {
     int sys_button = 0;
 
     PerformanceOverlayState perf_overlay;
+
+    // Muted looping video played behind the game screen (PPSSPP port)
+    BackgroundPlayer background_player;
 
     void update_overlays();
     void init_overlay_font_dirs();

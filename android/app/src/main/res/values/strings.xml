@@ -667,6 +667,12 @@
     <string name="settings_emulator_screen_orientation_landscape">Landscape</string>
     <string name="settings_emulator_portrait_y_offset">Portrait Y-Offset: %1$d px</string>
     <string name="settings_emulator_portrait_y_offset_desc">Vertical offset of the picture in Portrait mode. 0 keeps the 4:3 image aligned to the top; increase it to push the picture down and leave room at the top for touch controls.</string>
+    <string name="settings_emulator_animation_background">Animation Background</string>
+    <string name="settings_emulator_animation_background_desc">Play a looping video behind the game screen, filling the black margins around it in Portrait and Landscape modes. Use an H.264 MP4 video; sound is not played.</string>
+    <string name="settings_emulator_background_video">Background Video</string>
+    <string name="settings_emulator_background_video_desc">Pick the video file looping behind the game screen. It must be an H.264 MP4 video.</string>
+    <string name="settings_emulator_background_video_none">Not selected</string>
+    <string name="settings_background_video_resolve_failed">Failed to resolve the selected background video path.</string>
     <string name="settings_display_screen_orientation">Screen Orientation</string>
     <string name="settings_emulator_file_loading_delay">File Loading Delay: %1$d ms</string>
     <string name="settings_emulator_file_loading_delay_desc">Add an artificial delay to file loading. This is required for some games that load files too quickly compared to real hardware (e.g., Silent Hill).</string>
