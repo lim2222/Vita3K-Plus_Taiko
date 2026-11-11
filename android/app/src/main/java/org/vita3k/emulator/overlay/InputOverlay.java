@@ -21,6 +21,7 @@ import android.view.View;
 import java.util.Collections;
 import android.view.View.OnTouchListener;
 
+import android.os.Build;
 import android.os.SystemClock;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
@@ -64,11 +65,23 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
   private static long sLastVibrateTime = 0;
 
   // Taiko "big note": two fingers landing almost together on opposite sides of the same
-  // part of the drum (head with head, rim with rim) get a longer, heavier pulse that
-  // replaces the first hit's vibration. Ported from the Azahar/Dolphin tatacon.
+  // part of the drum (head with head, rim with rim) get a heavy thud that replaces the
+  // first hit's vibration. Ported from the Azahar/Dolphin tatacon.
   private final static long TATACON_BIG_HIT_PAIR_WINDOW_MS = 25;
   private final static long TATACON_BIG_HIT_QUIET_BEFORE_MS = 110;
-  private final static long TATACON_BIG_HIT_DURATION_MS = 130;
+  // The big-note pulse itself is Eden's heavy thud stretched over the whole note.
+  // Eden renders the game's rumble as one hard thud, then keeps refreshing it every
+  // 90 ms (RumbleShaper.SUSTAIN_INTERVAL_MS) for as long as the game keeps sending
+  // rumble - a big note sends it for a few hundred milliseconds, which is the audible
+  // motor "hum" and the fading aftershock. So the envelope here is: full-strength
+  // attack, a sustained mid section, then a fade-out. A flat one-shot buzzes at one
+  // speed, and a single short thud ends before the motor is even heard.
+  private final static long[] TATACON_BIG_HIT_THUD_TIMINGS_MS = {35L, 150L, 75L};
+  private final static float[] TATACON_BIG_HIT_THUD_SCALES = {1.0f, 0.6f, 0.3f};
+
+  // Whether the device vibrator supports the PRIMITIVE_THUD composition primitive
+  // (Android 11+, needs a good motor). Probed once, like Eden's lazy thudSupported.
+  private Boolean mThudPrimitiveSupported = null;
 
   // Tatacon hits keep their own timing so a big note can replace the first hit's pulse
   // without disturbing the shared button/dpad/joystick debounce.
@@ -945,8 +958,8 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
    * The first hit always vibrates immediately, so single notes stay responsive. When a
    * second finger lands on the opposite side of the same part (head with head, rim with
    * rim) within TATACON_BIG_HIT_PAIR_WINDOW_MS, and the pair is isolated from previous
-   * hits, it gets a longer, heavier pulse that replaces the first one. Both start at the
-   * configured amplitude, so the replacement is seamless.
+   * hits, it gets a heavy Eden-style thud (see vibrateTataconBigHit) that replaces the
+   * first one. Both start at the configured amplitude, so the replacement is seamless.
    *
    * @param zone      drum zone that was just pressed
    * @param eventTime MotionEvent.getEventTime(), unaffected by main thread jitter
@@ -985,7 +998,7 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       // Bypasses the debounce on purpose; replaces the first hit's pulse.
       mLastTataconHapticTime = eventTime;
       sLastVibrateTime = eventTime; // keep other controls' shared debounce in sync
-      vib.vibrate(VibrationEffect.createOneShot(TATACON_BIG_HIT_DURATION_MS, strength));
+      vibrateTataconBigHit(vib, strength);
       return;
     }
 
@@ -1007,6 +1020,53 @@ public final class InputOverlay extends SurfaceView implements OnTouchListener
       amplitude = strength;
     }
     vib.vibrate(VibrationEffect.createOneShot(duration, amplitude));
+  }
+
+  /**
+   * Vibrates the taiko "big note" thud, ported from Eden's HID rumble pipeline
+   * (YuzuVibrator.ThudEffect + RumbleShaper). A big note arrives there at full
+   * amplitude and the game keeps sending rumble for a few hundred milliseconds, which
+   * Eden renders as one hard thud refreshed every 90 ms for as long as it lasts - the
+   * heavy attack, the audible motor "hum" and the fading aftershock:
+   *
+   * - PRIMITIVE_THUD composition primitives when the motor supports them: a chain of
+   *   decaying thuds with small gaps, mirroring the shaper's refreshes.
+   * - otherwise a waveform with the same envelope: full-strength attack, sustained
+   *   mid section at 60%, fading tail at 30%.
+   *
+   * @param vib     the device vibrator
+   * @param strength configured haptic amplitude, 1..255; it maps directly onto the
+   *                thud scale, 255 matching Eden's full-amplitude big note
+   */
+  private void vibrateTataconBigHit(Vibrator vib, int strength) {
+    final int amp = Math.max(1, Math.min(255, strength));
+    final float scale = amp / 255f;
+
+    if (mThudPrimitiveSupported == null)
+      mThudPrimitiveSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+              && hasThudPrimitive(vib);
+    // The SDK check is repeated next to the composition APIs so static analysis sees
+    // the guard at the call site, like Eden's ThudEffect does.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && mThudPrimitiveSupported) {
+      vib.vibrate(VibrationEffect.startComposition()
+              .addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD, scale)
+              .addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD, scale * 0.6f, 30)
+              .addPrimitive(VibrationEffect.Composition.PRIMITIVE_THUD, scale * 0.3f, 50)
+              .compose());
+      return;
+    }
+
+    // No thud primitive: the same envelope as a plain waveform.
+    final int[] amplitudes = new int[TATACON_BIG_HIT_THUD_SCALES.length];
+    for (int i = 0; i < amplitudes.length; i++)
+      amplitudes[i] = Math.max(1, Math.round(amp * TATACON_BIG_HIT_THUD_SCALES[i]));
+    vib.vibrate(VibrationEffect.createWaveform(TATACON_BIG_HIT_THUD_TIMINGS_MS, amplitudes, -1));
+  }
+
+  private static boolean hasThudPrimitive(Vibrator vib) {
+    final boolean[] supported =
+            vib.arePrimitivesSupported(VibrationEffect.Composition.PRIMITIVE_THUD);
+    return supported.length > 0 && supported[0];
   }
 
   /**
