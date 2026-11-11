@@ -23,6 +23,9 @@ appimage/linuxdeploy*.AppImage
 *.apk
 *.ap_
 
+# Android release build outputs
+/android/app/release/
+
 # Files for the ART/Dalvik VM
 *.dex
 
