@@ -705,7 +705,6 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
     // renderer's background texture; render() then draws it behind the game
     // screen quad, filling the margins around it
     GLuint background_texture = 0;
-    SceFVector2 background_framebuffer_size = { fb_w, fb_h };
     if (background_player.is_loaded()) {
         background_player.update(wall_clock_now(), [&](const BackgroundPlayer::Frame &video_frame) {
             screen_renderer.update_background(video_frame.rgba, video_frame.width, video_frame.height, video_frame.serial);
@@ -762,7 +761,7 @@ void GLState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
         glBindTexture(GL_TEXTURE_2D, last_texture);
 
         screen_renderer.render(vp_pos, vp_size, need_uv ? uvs : nullptr, static_cast<GLuint>(surface_handle), texture_size, default_fbo, screen_orientation,
-            background_texture, &background_framebuffer_size);
+            background_texture, { fb_w, fb_h });
     }
 
     update_overlays();

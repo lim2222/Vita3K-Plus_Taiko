@@ -85,7 +85,7 @@ private:
     void upload_image(const overlay::image_info_base *img, image_entry &entry);
     void bind_texture(const overlay::compiled_resource::command_config &config);
     void draw_command(const overlay::compiled_resource::command &cmd,
-        float viewport_w, float viewport_h, float viewport_x, float viewport_y);
+        float viewport_w, float viewport_h, float viewport_x, float viewport_y, float framebuffer_h);
 };
 
 } // namespace renderer::gl

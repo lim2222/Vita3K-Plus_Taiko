@@ -258,7 +258,7 @@ void OverlayRenderer::bind_texture(const overlay::compiled_resource::command_con
 
 void OverlayRenderer::draw_command(const overlay::compiled_resource::command &cmd,
     float viewport_w, float viewport_h,
-    float viewport_x, float viewport_y) {
+    float viewport_x, float viewport_y, float framebuffer_h) {
     if (cmd.verts.empty())
         return;
 
@@ -324,8 +324,9 @@ void OverlayRenderer::draw_command(const overlay::compiled_resource::command &cm
         target_vp.y2 = viewport_y + viewport_h;
         sdf.transform(target_vp, { VIRTUAL_WIDTH, VIRTUAL_HEIGHT });
 
-        // Flip cy for GL's bottom-up gl_FragCoord.y
-        sdf.cy = 2.0f * viewport_y + viewport_h - sdf.cy;
+        // after the transform cy is in top-origin window coordinates while
+        // gl_FragCoord.y is bottom-up
+        sdf.cy = framebuffer_h - sdf.cy;
 
         glUniform4f(u_sdf_params,
             sdf.hx, sdf.hy,
@@ -435,8 +436,11 @@ void OverlayRenderer::render(const overlay::display_manager &manager,
     GLboolean last_color_mask[4];
     glGetBooleanv(GL_COLOR_WRITEMASK, last_color_mask);
 
+    // viewport_y is in top-origin window coordinates while glViewport and
+    // glScissor measure from the bottom-left corner of the framebuffer
+    const float viewport_y_gl = framebuffer_h - viewport_y - viewport_h;
     glBindFramebuffer(GL_FRAMEBUFFER, default_fbo);
-    glViewport(static_cast<GLint>(viewport_x), static_cast<GLint>(viewport_y),
+    glViewport(static_cast<GLint>(viewport_x), static_cast<GLint>(viewport_y_gl),
         static_cast<GLsizei>(viewport_w), static_cast<GLsizei>(viewport_h));
 
     glEnable(GL_BLEND);
@@ -445,7 +449,7 @@ void OverlayRenderer::render(const overlay::display_manager &manager,
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(static_cast<GLint>(viewport_x), static_cast<GLint>(viewport_y),
+    glScissor(static_cast<GLint>(viewport_x), static_cast<GLint>(viewport_y_gl),
         static_cast<GLsizei>(viewport_w), static_cast<GLsizei>(viewport_h));
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
@@ -454,7 +458,9 @@ void OverlayRenderer::render(const overlay::display_manager &manager,
 
     glUniform4f(u_ui_scale, VIRTUAL_WIDTH, VIRTUAL_HEIGHT, 1.f, 1.f);
 
-    glUniform4f(u_viewport, viewport_w, viewport_h, viewport_x, viewport_y);
+    // u_viewport.zw must match the actual glViewport offset: the vertex
+    // shader maps the clip rect into window coordinates with it
+    glUniform4f(u_viewport, viewport_w, viewport_h, viewport_x, viewport_y_gl);
 
     const auto timestamp_us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -481,7 +487,7 @@ void OverlayRenderer::render(const overlay::display_manager &manager,
         auto compiled = view->get_compiled();
 
         for (const auto &cmd : compiled.draw_commands) {
-            draw_command(cmd, viewport_w, viewport_h, viewport_x, viewport_y);
+            draw_command(cmd, viewport_w, viewport_h, viewport_x, viewport_y, framebuffer_h);
         }
 
         view->update(timestamp_us);

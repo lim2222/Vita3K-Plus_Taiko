@@ -35,102 +35,59 @@ static constexpr uint32_t screen_vertex_count = 4;
 
 using screen_vertices_t = screen_vertex[screen_vertex_count];
 
-SinglePassScreenFilter::SinglePassScreenFilter(ScreenRenderer &screen)
-    : ScreenFilter(screen) {}
+// Computes the rectangle the Vita display occupies in the swapchain, in
+// top-origin pixels. This is the single source of truth for where the game
+// screen is: the screen filters draw there, the animation background fills
+// the margins around it and the touch mapping uses it.
+DisplayRect compute_display_rect(const VKState &state, const vk::Extent2D &extent) {
+    DisplayRect rect{};
 
-SinglePassScreenFilter::~SinglePassScreenFilter() {
-    vk::Device device = screen.state.device;
-    // this will only happen when the user changes the option in the GUI, we can afford to waitIdle
-    screen.state.wait_gpu_idle();
-    device.destroy(pipeline);
-    device.destroy(pipeline_layout);
-    device.destroy(descriptor_pool);
-    device.destroy(descriptor_set_layout);
-    device.destroy(fragment_shader);
-    device.destroy(vertex_shader);
+    const float fb_w = static_cast<float>(extent.width);
+    const float fb_h = static_cast<float>(extent.height);
+    if (fb_h <= 0.0f)
+        return rect;
 
-    device.destroy(sampler);
-}
+    const float window_aspect = fb_w / fb_h;
+    constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
+    constexpr float portrait_aspect = 4.0f / 3.0f; // 4:3 for portrait mode
+    const bool pixel_perfect = state.fullscreen_hd_res_pixel_perfect && state.fullscreen
+        && !(extent.width % DEFAULT_RES_WIDTH)
+        && !(extent.height % (DEFAULT_RES_HEIGHT - 4));
 
-void SinglePassScreenFilter::create_layout_sync() {
-    vk::Device device = screen.state.device;
+    // Determine effective aspect ratio based on screen orientation
+    // 0=Auto (follow device), 1=Portrait (4:3, top), 2=Landscape (Vita native)
+    // For Auto mode: check if device is in portrait orientation (rotation 0 or 2)
+    const bool is_portrait_mode = (state.screen_orientation == 1)
+        || (state.screen_orientation == 0 && (state.device_native_rotation == 0 || state.device_native_rotation == 2));
+    const float target_aspect = is_portrait_mode ? portrait_aspect : vita_aspect;
 
-    vk::DescriptorSetLayoutBinding sampler_layout_binding{
-        .binding = 0,
-        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-        .descriptorCount = 1,
-        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-    };
-    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
-    descriptor_info.setBindings(sampler_layout_binding);
-    descriptor_set_layout = device.createDescriptorSetLayout(descriptor_info);
-
-    vk::DescriptorPoolSize pool_size{
-        .type = vk::DescriptorType::eCombinedImageSampler,
-        // one set for the game screen and one for the animation background,
-        // per swapchain image
-        .descriptorCount = screen.swapchain_size * 2
-    };
-    vk::DescriptorPoolCreateInfo pool_info{
-        .maxSets = screen.swapchain_size * 2,
-    };
-    pool_info.setPoolSizes(pool_size);
-    descriptor_pool = device.createDescriptorPool(pool_info);
-
-    vk::DescriptorSetAllocateInfo descr_set_info{
-        .descriptorPool = descriptor_pool,
-    };
-    std::vector<vk::DescriptorSetLayout> descr_set_layouts(screen.swapchain_size * 2, descriptor_set_layout);
-    descr_set_info.setSetLayouts(descr_set_layouts);
-    descriptor_sets = device.allocateDescriptorSets(descr_set_info);
-
-    vk::PipelineLayoutCreateInfo layout_info{};
-    layout_info.setSetLayouts(descriptor_set_layout);
-    // add push constant for fxaa pipeline, not used by the normal pipeline
-    vk::PushConstantRange push_constant{
-        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-        .offset = 0,
-        .size = 2 * sizeof(float),
-    };
-    layout_info.setPushConstantRanges(push_constant);
-    pipeline_layout = device.createPipelineLayout(layout_info);
-
-    // create vao
-    vao.size = sizeof(screen_vertices_t) * screen.swapchain_size;
-    vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
-    if (!vao.mapped_data)
-        LOG_ERROR("screen filter vao is not host-mappable on this device; falling back to updateBuffer");
-
-    // create the animation background quad: a single fullscreen quad with
-    // identity uvs, shared by all swapchain images and never rewritten
-    background_vao.size = sizeof(screen_vertices_t);
-    background_vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
-    background_vao_written = false;
-    if (background_vao.mapped_data) {
-        const screen_vertices_t background_quad = {
-            { { 1.f, -1.f, 0.0f }, { 1.f, 0.f } },
-            { { -1.f, -1.f, 0.0f }, { 0.f, 0.f } },
-            { { 1.f, 1.f, 0.0f }, { 1.f, 1.f } },
-            { { -1.f, 1.f, 0.0f }, { 0.f, 1.f } },
-        };
-        memcpy(background_vao.mapped_data, &background_quad, sizeof(background_quad));
-        background_vao_written = true;
+    if (state.stretch_the_display_area && !pixel_perfect) {
+        // Match the aspect ratio to the screen size.
+        rect.x = 0.0f;
+        rect.y = 0.0f;
+        rect.width = fb_w;
+        rect.height = fb_h;
+    } else if ((window_aspect > target_aspect) && !pixel_perfect) {
+        // Window is wide. Pin top and bottom.
+        rect.width = fb_h * target_aspect;
+        rect.height = fb_h;
+        rect.x = (fb_w - rect.width) / 2.0f;
+        rect.y = 0.0f;
+    } else {
+        // Window is tall. Pin left and right.
+        rect.width = fb_w;
+        rect.height = fb_w / target_aspect;
+        rect.x = 0.0f;
+        rect.y = is_portrait_mode ? state.portrait_y_offset : (fb_h - rect.height) / 2.0f;
     }
 
-    // create and zero-fill uvs
-    last_uvs.resize(screen.swapchain_size);
-    std::fill(last_uvs.begin(), last_uvs.end(), std::array<float, 4>());
+    return rect;
 }
 
-void SinglePassScreenFilter::create_graphics_pipeline() {
-    // create shader modules
-
-    fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
-    const auto vertex_shader_path = builtin_shaders_path / get_vertex_name();
-    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
-
-    vertex_shader = vkutil::load_shader(screen.state.device, vertex_shader_path);
-    fragment_shader = vkutil::load_shader(screen.state.device, fragment_shader_path);
+// Graphics pipeline drawing a screen_vertex quad with a dynamic viewport and
+// scissor, shared by the game screen filters and the animation background.
+static vk::Pipeline create_quad_graphics_pipeline(vk::Device device, vk::ShaderModule vertex_shader, vk::ShaderModule fragment_shader,
+    vk::PipelineLayout pipeline_layout, vk::RenderPass render_pass) {
     vk::PipelineShaderStageCreateInfo vert_info{
         .stage = vk::ShaderStageFlagBits::eVertex,
         .module = vertex_shader,
@@ -207,16 +164,276 @@ void SinglePassScreenFilter::create_graphics_pipeline() {
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
         .layout = pipeline_layout,
-        .renderPass = screen.default_render_pass,
+        .renderPass = render_pass,
         .subpass = 0
     };
     pipeline_info.setStages(shader_stages);
 
-    const auto result = screen.state.device.createGraphicsPipeline(VK_NULL_HANDLE, pipeline_info);
+    const auto result = device.createGraphicsPipeline(VK_NULL_HANDLE, pipeline_info);
     if (result.result != vk::Result::eSuccess) {
         LOG_CRITICAL("Failed to create pipeline.");
     }
-    pipeline = result.value;
+    return result.value;
+}
+
+ScreenFilter::~ScreenFilter() {
+    // the derived class already waited and destroyed its own objects; the
+    // shared animation background drawing needs its own wait before freeing
+    if (!background_objects_created)
+        return;
+    vk::Device device = screen.state.device;
+    screen.state.wait_gpu_idle();
+    device.destroy(background_pipeline);
+    device.destroy(background_post_pipeline);
+    device.destroy(background_pipeline_layout);
+    device.destroy(background_descriptor_pool); // frees the sets as well
+    device.destroy(background_descriptor_set_layout);
+    device.destroy(background_fragment_shader);
+    device.destroy(background_vertex_shader);
+    device.destroy(background_sampler);
+    // background_vao cleans itself up
+}
+
+void ScreenFilter::ensure_background_objects() {
+    if (background_objects_created)
+        return;
+    vk::Device device = screen.state.device;
+
+    fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
+    background_vertex_shader = vkutil::load_shader(device, builtin_shaders_path / "render_main.vert.spv");
+    background_fragment_shader = vkutil::load_shader(device, builtin_shaders_path / "render_main.frag.spv");
+
+    // one combined image sampler binding, refreshed per frame
+    vk::DescriptorSetLayoutBinding sampler_layout_binding{
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+    };
+    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+    descriptor_info.setBindings(sampler_layout_binding);
+    background_descriptor_set_layout = device.createDescriptorSetLayout(descriptor_info);
+
+    // one descriptor set per swapchain image, like the game screen quad
+    vk::DescriptorPoolSize pool_size{
+        .type = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = screen.swapchain_size
+    };
+    vk::DescriptorPoolCreateInfo pool_info{
+        .maxSets = screen.swapchain_size,
+    };
+    pool_info.setPoolSizes(pool_size);
+    background_descriptor_pool = device.createDescriptorPool(pool_info);
+
+    vk::DescriptorSetAllocateInfo descr_set_info{
+        .descriptorPool = background_descriptor_pool,
+    };
+    std::vector<vk::DescriptorSetLayout> descr_set_layouts(screen.swapchain_size, background_descriptor_set_layout);
+    descr_set_info.setSetLayouts(descr_set_layouts);
+    background_descriptor_sets = device.allocateDescriptorSets(descr_set_info);
+
+    // no push constants: the plain render_main shaders sample binding 0 only
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setSetLayouts(background_descriptor_set_layout);
+    background_pipeline_layout = device.createPipelineLayout(layout_info);
+
+    // one pipeline per render pass, they are not compatible with each other
+    background_pipeline = create_background_pipeline(screen.default_render_pass);
+    background_post_pipeline = create_background_pipeline(screen.post_filter_render_pass);
+
+    vk::SamplerCreateInfo sampler_info{
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    };
+    background_sampler = device.createSampler(sampler_info);
+
+    // one fullscreen quad with identity uvs, shared by all swapchain images
+    // and never rewritten
+    background_vao.size = sizeof(screen_vertices_t);
+    background_vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
+    background_vao_written = false;
+
+    background_objects_created = true;
+}
+
+vk::Pipeline ScreenFilter::create_background_pipeline(vk::RenderPass render_pass) {
+    return create_quad_graphics_pipeline(screen.state.device, background_vertex_shader, background_fragment_shader,
+        background_pipeline_layout, render_pass);
+}
+
+void ScreenFilter::prepare_background() {
+    ensure_background_objects();
+
+    // the background quad never changes, write it once. This runs outside the
+    // render pass: vkCmdUpdateBuffer (the fallback for buffers that are not
+    // host-mappable) is not allowed inside one.
+    if (background_vao_written)
+        return;
+
+    const screen_vertices_t background_quad = {
+        { { 1.f, -1.f, 0.0f }, { 1.f, 0.f } },
+        { { -1.f, -1.f, 0.0f }, { 0.f, 0.f } },
+        { { 1.f, 1.f, 0.0f }, { 1.f, 1.f } },
+        { { -1.f, 1.f, 0.0f }, { 0.f, 1.f } },
+    };
+    if (background_vao.mapped_data)
+        memcpy(background_vao.mapped_data, &background_quad, sizeof(background_quad));
+    else
+        screen.current_cmd_buffer.updateBuffer(background_vao.buffer, 0, sizeof(background_quad), &background_quad);
+    background_vao_written = true;
+}
+
+void ScreenFilter::render_background(vk::ImageView background_img, bool post_processing_pass) {
+    if (!background_objects_created || !background_img)
+        return; // not prepared (outside the render pass) yet, skip this frame
+
+    // refresh the descriptor set of this swapchain image
+    vk::DescriptorImageInfo descr_image_info{
+        .sampler = background_sampler,
+        .imageView = background_img,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    vk::WriteDescriptorSet write_descr{
+        .dstSet = background_descriptor_sets[screen.swapchain_image_idx],
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+    };
+    write_descr.setImageInfo(descr_image_info);
+    screen.state.device.updateDescriptorSets(write_descr, {});
+
+    // the margins around the game screen, in top-origin pixels like
+    // compute_display_rect
+    const DisplayRect display = compute_display_rect(screen.state, screen.extent);
+    const float fb_w = static_cast<float>(screen.extent.width);
+    const float fb_h = static_cast<float>(screen.extent.height);
+    const float left = display.x;
+    const float right = fb_w - display.x - display.width;
+    const float bottom = fb_h - display.y - display.height;
+
+    vk::CommandBuffer cmd_buffer = screen.current_cmd_buffer;
+    cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics,
+        post_processing_pass ? background_post_pipeline : background_pipeline);
+    cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, background_pipeline_layout, 0,
+        background_descriptor_sets[screen.swapchain_image_idx], {});
+
+    const vk::DeviceSize offset = 0;
+    cmd_buffer.bindVertexBuffers(0, background_vao.buffer, offset);
+
+    const auto draw_bar = [&](float bar_x, float bar_y, float bar_w, float bar_h) {
+        vk::Viewport vk_viewport{
+            .x = bar_x,
+            .y = bar_y,
+            .width = bar_w,
+            .height = bar_h,
+            .minDepth = 0.0f,
+            .maxDepth = 1.0f
+        };
+        cmd_buffer.setViewport(0, vk_viewport);
+        vk::Rect2D vk_scissor{
+            .offset = { static_cast<int32_t>(bar_x), static_cast<int32_t>(bar_y) },
+            .extent = { static_cast<uint32_t>(bar_w), static_cast<uint32_t>(bar_h) }
+        };
+        cmd_buffer.setScissor(0, vk_scissor);
+        cmd_buffer.draw(4, 1, 0, 0);
+    };
+
+    // like PPSSPP: landscape fills both side margins, portrait only draws
+    // below the screen and keeps the bar above it black
+    if (left > 0.5f || right > 0.5f) {
+        if (left > 0.5f)
+            draw_bar(0.0f, 0.0f, left, fb_h);
+        if (right > 0.5f)
+            draw_bar(display.x + display.width, 0.0f, right, fb_h);
+    } else if (bottom > 0.5f) {
+        draw_bar(0.0f, display.y + display.height, fb_w, bottom);
+    }
+}
+
+SinglePassScreenFilter::SinglePassScreenFilter(ScreenRenderer &screen)
+    : ScreenFilter(screen) {}
+
+SinglePassScreenFilter::~SinglePassScreenFilter() {
+    vk::Device device = screen.state.device;
+    // this will only happen when the user changes the option in the GUI, we can afford to waitIdle
+    screen.state.wait_gpu_idle();
+    device.destroy(pipeline);
+    device.destroy(pipeline_layout);
+    device.destroy(descriptor_pool);
+    device.destroy(descriptor_set_layout);
+    device.destroy(fragment_shader);
+    device.destroy(vertex_shader);
+
+    device.destroy(sampler);
+}
+
+void SinglePassScreenFilter::create_layout_sync() {
+    vk::Device device = screen.state.device;
+
+    vk::DescriptorSetLayoutBinding sampler_layout_binding{
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = 1,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+    };
+    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+    descriptor_info.setBindings(sampler_layout_binding);
+    descriptor_set_layout = device.createDescriptorSetLayout(descriptor_info);
+
+    vk::DescriptorPoolSize pool_size{
+        .type = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = screen.swapchain_size
+    };
+    vk::DescriptorPoolCreateInfo pool_info{
+        .maxSets = screen.swapchain_size,
+    };
+    pool_info.setPoolSizes(pool_size);
+    descriptor_pool = device.createDescriptorPool(pool_info);
+
+    vk::DescriptorSetAllocateInfo descr_set_info{
+        .descriptorPool = descriptor_pool,
+    };
+    std::vector<vk::DescriptorSetLayout> descr_set_layouts(screen.swapchain_size, descriptor_set_layout);
+    descr_set_info.setSetLayouts(descr_set_layouts);
+    descriptor_sets = device.allocateDescriptorSets(descr_set_info);
+
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setSetLayouts(descriptor_set_layout);
+    // add push constant for fxaa pipeline, not used by the normal pipeline
+    vk::PushConstantRange push_constant{
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .offset = 0,
+        .size = 2 * sizeof(float),
+    };
+    layout_info.setPushConstantRanges(push_constant);
+    pipeline_layout = device.createPipelineLayout(layout_info);
+
+    // create vao
+    vao.size = sizeof(screen_vertices_t) * screen.swapchain_size;
+    vao.init_buffer(vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
+    if (!vao.mapped_data)
+        LOG_ERROR("screen filter vao is not host-mappable on this device; falling back to updateBuffer");
+
+    // create and zero-fill uvs
+    last_uvs.resize(screen.swapchain_size);
+    std::fill(last_uvs.begin(), last_uvs.end(), std::array<float, 4>());
+}
+
+void SinglePassScreenFilter::create_graphics_pipeline() {
+    // create shader modules
+
+    fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
+    const auto vertex_shader_path = builtin_shaders_path / get_vertex_name();
+    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
+
+    vertex_shader = vkutil::load_shader(screen.state.device, vertex_shader_path);
+    fragment_shader = vkutil::load_shader(screen.state.device, fragment_shader_path);
+
+    pipeline = create_quad_graphics_pipeline(screen.state.device, vertex_shader, fragment_shader,
+        pipeline_layout, screen.default_render_pass);
 }
 
 std::string_view SinglePassScreenFilter::get_vertex_name() {
@@ -282,7 +499,7 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
             .imageLayout = src_layout,
         };
         vk::WriteDescriptorSet write_descr{
-            .dstSet = descriptor_sets[screen.swapchain_image_idx * 2 + 1],
+            .dstSet = descriptor_sets[screen.swapchain_image_idx],
             .dstBinding = 0,
             .dstArrayElement = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -296,38 +513,15 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
             .extent = screen.extent
         };
         screen.current_cmd_buffer.setScissor(0, vk_scissor);
+        const DisplayRect display = compute_display_rect(screen.state, screen.extent);
         vk::Viewport vk_viewport{
+            .x = display.x,
+            .y = display.y,
+            .width = display.width,
+            .height = display.height,
             .minDepth = 0.0f,
             .maxDepth = 1.0f
         };
-        // compute viewport now
-        const float window_aspect = static_cast<float>(screen.extent.width) / screen.extent.height;
-        constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
-        constexpr float portrait_aspect = 4.0f / 3.0f;
-        const bool is_portrait_mode = (screen.state.screen_orientation == 1) || 
-                                      (screen.state.screen_orientation == 0 && (screen.state.device_native_rotation == 0 || screen.state.device_native_rotation == 2));
-        const float target_aspect = is_portrait_mode ? portrait_aspect : vita_aspect;
-        const bool is_portrait = is_portrait_mode;
-        const bool fullscreen_hd_res_pixel_perfect_en = screen.state.fullscreen_hd_res_pixel_perfect && screen.state.fullscreen && !(screen.extent.width % DEFAULT_RES_WIDTH) && !(screen.extent.height % (DEFAULT_RES_HEIGHT - 4));
-        if (screen.state.stretch_the_display_area && !fullscreen_hd_res_pixel_perfect_en) {
-            // Match the aspect ratio to the screen size.
-            vk_viewport.width = static_cast<float>(screen.extent.width);
-            vk_viewport.height = static_cast<float>(screen.extent.height);
-            vk_viewport.x = 0.0f;
-            vk_viewport.y = 0.0f;
-        } else if ((window_aspect > vita_aspect) && !fullscreen_hd_res_pixel_perfect_en) {
-            // Window is wide. Pin top and bottom.
-            vk_viewport.width = screen.extent.height * vita_aspect;
-            vk_viewport.height = static_cast<float>(screen.extent.height);
-            vk_viewport.x = (screen.extent.width - vk_viewport.width) / 2.0f;
-            vk_viewport.y = 0.0f;
-        } else {
-            // Window is tall. Pin left and right.
-            vk_viewport.width = static_cast<float>(screen.extent.width);
-            vk_viewport.height = screen.extent.width / target_aspect;
-            vk_viewport.x = 0.0f;
-            vk_viewport.y = is_portrait ? screen.state.portrait_y_offset : (screen.extent.height - vk_viewport.height) / 2.0f;
-        }
         screen.current_cmd_buffer.setViewport(0, vk_viewport);
     }
 
@@ -336,81 +530,9 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
         screen.current_cmd_buffer.bindVertexBuffers(0, vao.buffer, offset);
 
         screen.current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx * 2 + 1], {});
+        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx], {});
 
         std::array<float, 2> inv_size = { 1.f / viewport.texture_width, 1.f / viewport.texture_height };
-        screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(float), inv_size.data());
-
-        screen.current_cmd_buffer.draw(4, 1, 0, 0);
-    }
-}
-
-void SinglePassScreenFilter::prepare_background() {
-    // the background quad never changes, write it once. This runs outside the
-    // render pass: vkCmdUpdateBuffer (the fallback for buffers that are not
-    // host-mappable) is not allowed inside one.
-    if (background_vao_written)
-        return;
-
-    const screen_vertices_t background_quad = {
-        { { 1.f, -1.f, 0.0f }, { 1.f, 0.f } },
-        { { -1.f, -1.f, 0.0f }, { 0.f, 0.f } },
-        { { 1.f, 1.f, 0.0f }, { 1.f, 1.f } },
-        { { -1.f, 1.f, 0.0f }, { 0.f, 1.f } },
-    };
-    if (background_vao.mapped_data)
-        memcpy(background_vao.mapped_data, &background_quad, sizeof(background_quad));
-    else
-        screen.current_cmd_buffer.updateBuffer(background_vao.buffer, 0, sizeof(background_quad), &background_quad);
-    background_vao_written = true;
-}
-
-void SinglePassScreenFilter::render_background(vk::ImageView background_img, uint32_t background_width, uint32_t background_height) {
-    if (!background_vao_written)
-        return; // not prepared (outside the render pass) yet, skip this frame
-
-    {
-        // update the background descriptor set of this swapchain image
-        vk::DescriptorImageInfo descr_image_info{
-            .sampler = sampler,
-            .imageView = background_img,
-            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-        };
-        vk::WriteDescriptorSet write_descr{
-            .dstSet = descriptor_sets[screen.swapchain_image_idx * 2],
-            .dstBinding = 0,
-            .dstArrayElement = 0,
-            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-        };
-        write_descr.setImageInfo(descr_image_info);
-        screen.state.device.updateDescriptorSets(write_descr, {});
-    }
-
-    {
-        // the background covers the whole swapchain, the game viewport is
-        // applied back by the game quad draw that follows
-        vk::Rect2D vk_scissor{
-            .offset = { 0, 0 },
-            .extent = screen.extent
-        };
-        screen.current_cmd_buffer.setScissor(0, vk_scissor);
-        vk::Viewport vk_viewport{
-            .x = 0.0f,
-            .y = 0.0f,
-            .width = static_cast<float>(screen.extent.width),
-            .height = static_cast<float>(screen.extent.height),
-            .minDepth = 0.0f,
-            .maxDepth = 1.0f
-        };
-        screen.current_cmd_buffer.setViewport(0, vk_viewport);
-
-        const vk::DeviceSize offset = 0;
-        screen.current_cmd_buffer.bindVertexBuffers(0, background_vao.buffer, offset);
-
-        screen.current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-        screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx * 2], {});
-
-        std::array<float, 2> inv_size = { 1.f / background_width, 1.f / background_height };
         screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(float), inv_size.data());
 
         screen.current_cmd_buffer.draw(4, 1, 0, 0);
@@ -609,29 +731,13 @@ void FSRScreenFilter::init() {
 }
 
 void FSRScreenFilter::on_resize() {
-    // compute the extent
-    const float window_aspect = static_cast<float>(screen.extent.width) / screen.extent.height;
-    const float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
-    const bool fullscreen_hd_res_pixel_perfect_en = screen.state.fullscreen_hd_res_pixel_perfect & screen.state.fullscreen & !(screen.extent.width % DEFAULT_RES_WIDTH) & !(screen.extent.height % (DEFAULT_RES_HEIGHT - 4));
-    if (screen.state.stretch_the_display_area && !fullscreen_hd_res_pixel_perfect_en) {
-        // Match the aspect ratio to the screen size.
-        output_size.width = static_cast<float>(screen.extent.width);
-        output_size.height = static_cast<float>(screen.extent.height);
-        output_offset.width = 0.0f;
-        output_offset.height = 0.0f;
-    } else if ((window_aspect > vita_aspect) && !fullscreen_hd_res_pixel_perfect_en) {
-        // Window is wide. Pin top and bottom.
-        output_size.width = static_cast<uint32_t>(std::round(screen.extent.height * vita_aspect));
-        output_size.height = screen.extent.height;
-        output_offset.width = static_cast<uint32_t>(std::round((screen.extent.width - output_size.width) / 2.0f));
-        output_offset.height = 0.0;
-    } else {
-        // Window is tall. Pin left and right.
-        output_size.width = screen.extent.width;
-        output_size.height = static_cast<uint32_t>(std::round(screen.extent.width / vita_aspect));
-        output_offset.width = 0.0f;
-        output_offset.height = static_cast<uint32_t>(std::round((screen.extent.height - output_size.height) / 2.0f));
-    }
+    // compute the output rectangle, shared with the other screen filters
+    // and the animation background margins
+    const DisplayRect display = compute_display_rect(screen.state, screen.extent);
+    output_size.width = static_cast<uint32_t>(std::round(display.width));
+    output_size.height = static_cast<uint32_t>(std::round(display.height));
+    output_offset.width = static_cast<uint32_t>(std::round(display.x));
+    output_offset.height = static_cast<uint32_t>(std::round(display.y));
 
     // recreate the intermediate images
     for (auto &img : intermediate_images) {
@@ -689,6 +795,21 @@ void FSRScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_img, vk::
     if (!is_pre_renderpass)
         // we are using compute shaders
         return;
+
+    // the output rectangle can change at runtime without a swapchain rebuild
+    // (portrait y offset slider, orientation flip): recompute the
+    // intermediate images when it does. We are outside the render pass and
+    // rebuilding them requires the gpu to be idle.
+    const DisplayRect display = compute_display_rect(screen.state, screen.extent);
+    const uint32_t expected_width = static_cast<uint32_t>(std::round(display.width));
+    const uint32_t expected_height = static_cast<uint32_t>(std::round(display.height));
+    const uint32_t expected_x = static_cast<uint32_t>(std::round(display.x));
+    const uint32_t expected_y = static_cast<uint32_t>(std::round(display.y));
+    if (expected_width != output_size.width || expected_height != output_size.height
+        || expected_x != output_offset.width || expected_y != output_offset.height) {
+        screen.state.wait_gpu_idle();
+        on_resize();
+    }
 
     // update descriptor set, (only the easu src)
     vk::DescriptorImageInfo descr_image_info{

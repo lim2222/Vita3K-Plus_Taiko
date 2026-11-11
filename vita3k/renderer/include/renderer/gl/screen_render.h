@@ -30,7 +30,7 @@ public:
 
     bool init(const fs::path &static_assets);
     void render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo = 0, uint32_t screen_rotation = 0,
-        GLuint background_texture = 0, const SceFVector2 *background_framebuffer_size = nullptr);
+        GLuint background_texture = 0, const SceFVector2 framebuffer_size = { 0.0f, 0.0f });
 
     void destroy();
 

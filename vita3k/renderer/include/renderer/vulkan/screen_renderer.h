@@ -116,7 +116,7 @@ public:
     bool acquire_swapchain_image();
     void begin_default_render_pass();
     void render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport,
-        vk::ImageView background_view = nullptr, uint32_t background_width = 0, uint32_t background_height = 0);
+        vk::ImageView background_view = nullptr);
     void swap_window();
     void set_filter(const std::string_view &filter);
 

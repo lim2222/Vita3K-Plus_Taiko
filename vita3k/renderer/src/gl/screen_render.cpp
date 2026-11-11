@@ -92,7 +92,7 @@ bool ScreenRenderer::init(const fs::path &static_assets) {
 }
 
 void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &viewport_size, const float *uvs, const GLuint texture, const SceFVector2 texture_size, GLuint default_fbo, uint32_t screen_rotation,
-    GLuint background_texture, const SceFVector2 *background_framebuffer_size) {
+    GLuint background_texture, const SceFVector2 framebuffer_size) {
     // Code for backup and restore is taken from ImGui project ImGui_ImplSdlGL3_RenderDrawData
     // Backup GL state
     GLint last_framebuffer;
@@ -132,7 +132,10 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
     glDisable(GL_CULL_FACE);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
-    glViewport(static_cast<GLint>(viewport_pos.x), static_cast<GLint>(viewport_pos.y), static_cast<GLsizei>(viewport_size.x),
+    // viewport_pos is in top-origin window coordinates while glViewport
+    // measures the viewport from the bottom-left corner of the framebuffer
+    const GLint viewport_y_gl = static_cast<GLint>(framebuffer_size.y - viewport_pos.y - viewport_size.y);
+    glViewport(static_cast<GLint>(viewport_pos.x), viewport_y_gl, static_cast<GLsizei>(viewport_size.x),
         static_cast<GLsizei>(viewport_size.y));
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -220,11 +223,15 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
         glUniform1ui(rotationLocation, screen_rotation);
     }
 
-    if (background_texture && background_framebuffer_size) {
-        // draw the animation background over the whole framebuffer: the game
-        // screen quad drawn right after covers its middle and leaves the
-        // margins (portrait lower half, landscape sides) to it
-        glViewport(0, 0, static_cast<GLsizei>(background_framebuffer_size->x), static_cast<GLsizei>(background_framebuffer_size->y));
+    if (background_texture) {
+        // draw the animation background into the margins around the game
+        // screen, like PPSSPP: landscape fills both side margins, portrait
+        // only fills below the screen and leaves the margin above it black
+        const float fb_w = framebuffer_size.x;
+        const float fb_h = framebuffer_size.y;
+        const float left = viewport_pos.x;
+        const float right = fb_w - viewport_pos.x - viewport_size.x;
+        const float bottom = fb_h - viewport_pos.y - viewport_size.y;
 
         glBindBuffer(GL_ARRAY_BUFFER, m_background_vbo);
         glVertexAttribPointer(
@@ -248,15 +255,28 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
             const GLint invBackgroundLocation = glGetUniformLocation(*shader, "inv_frame_size");
             glUniform2f(invBackgroundLocation, 1.0f / m_background_width, 1.0f / m_background_height);
         }
-        if (rotationLocation >= 0) {
-            glUniform1ui(rotationLocation, 0);
-        }
 
         glBindTexture(GL_TEXTURE_2D, background_texture);
-        glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+        const auto draw_bar = [&](float bar_x, float bar_y, float bar_w, float bar_h) {
+            // bar_y is in top-origin window coordinates, glViewport measures
+            // from the bottom-left corner of the framebuffer
+            glViewport(static_cast<GLint>(bar_x), static_cast<GLint>(fb_h - bar_y - bar_h),
+                static_cast<GLsizei>(bar_w), static_cast<GLsizei>(bar_h));
+            glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+        };
+
+        if (left > 0.5f || right > 0.5f) {
+            if (left > 0.5f)
+                draw_bar(0.0f, 0.0f, left, fb_h);
+            if (right > 0.5f)
+                draw_bar(viewport_pos.x + viewport_size.x, 0.0f, right, fb_h);
+        } else if (bottom > 0.5f) {
+            draw_bar(0.0f, viewport_pos.y + viewport_size.y, fb_w, bottom);
+        }
 
         // restore the game screen state
-        glViewport(static_cast<GLint>(viewport_pos.x), static_cast<GLint>(viewport_pos.y), static_cast<GLsizei>(viewport_size.x),
+        glViewport(static_cast<GLint>(viewport_pos.x), viewport_y_gl, static_cast<GLsizei>(viewport_size.x),
             static_cast<GLsizei>(viewport_size.y));
 
         glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
@@ -280,9 +300,6 @@ void ScreenRenderer::render(const SceFVector2 &viewport_pos, const SceFVector2 &
         if (enable_fxaa) {
             const GLint invScreenLocation = glGetUniformLocation(*shader, "inv_frame_size");
             glUniform2f(invScreenLocation, 1 / texture_size.x, 1 / texture_size.y);
-        }
-        if (rotationLocation >= 0) {
-            glUniform1ui(rotationLocation, screen_rotation);
         }
     }
 

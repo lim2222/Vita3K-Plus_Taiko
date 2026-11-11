@@ -1424,43 +1424,13 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
 
     // store viewport for touch
     {
-        const float fb_w = static_cast<float>(screen_renderer.extent.width);
-        const float fb_h = static_cast<float>(screen_renderer.extent.height);
-        display.viewport_drawable_w = static_cast<int>(fb_w);
-        display.viewport_drawable_h = static_cast<int>(fb_h);
-        if (fb_h > 0.0f) {
-            const float window_aspect = fb_w / fb_h;
-            constexpr float vita_aspect = static_cast<float>(DEFAULT_RES_WIDTH) / DEFAULT_RES_HEIGHT;
-            constexpr float portrait_aspect = 4.0f / 3.0f;  // 4:3 for portrait mode
-            const bool pixel_perfect = fullscreen_hd_res_pixel_perfect && fullscreen
-                && !(screen_renderer.extent.width % DEFAULT_RES_WIDTH)
-                && !(screen_renderer.extent.height % (DEFAULT_RES_HEIGHT - 4));
-
-            // Determine effective aspect ratio based on screen orientation
-            // 0=Auto (follow device), 1=Portrait (4:3, top), 2=Landscape (Vita native)
-            // For Auto mode: check if device is in portrait orientation (rotation 0 or 2)
-            const bool is_portrait_mode = (screen_orientation == 1) || 
-                                          (screen_orientation == 0 && (device_native_rotation == 0 || device_native_rotation == 2));
-            const float target_aspect = is_portrait_mode ? portrait_aspect : vita_aspect;
-            const bool is_portrait = is_portrait_mode;
-
-            if (stretch_the_display_area && !pixel_perfect) {
-                display.viewport_x = 0.0f;
-                display.viewport_y = 0.0f;
-                display.viewport_w = fb_w;
-                display.viewport_h = fb_h;
-            } else if ((window_aspect > target_aspect) && !pixel_perfect) {
-                display.viewport_w = fb_h * target_aspect;
-                display.viewport_h = fb_h;
-                display.viewport_x = (fb_w - display.viewport_w) / 2.0f;
-                display.viewport_y = is_portrait ? 0.0f : 0.0f;
-            } else {
-                display.viewport_w = fb_w;
-                display.viewport_h = fb_w / target_aspect;
-                display.viewport_x = 0.0f;
-                display.viewport_y = is_portrait ? portrait_y_offset : (fb_h - display.viewport_h) / 2.0f;
-            }
-        }
+        const DisplayRect display_rect = compute_display_rect(*this, screen_renderer.extent);
+        display.viewport_drawable_w = static_cast<int>(screen_renderer.extent.width);
+        display.viewport_drawable_h = static_cast<int>(screen_renderer.extent.height);
+        display.viewport_x = display_rect.x;
+        display.viewport_y = display_rect.y;
+        display.viewport_w = display_rect.width;
+        display.viewport_h = display_rect.height;
     }
 
     if (has_overlays && screen_renderer.current_cmd_buffer) {
@@ -1474,9 +1444,7 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
     // the background image of this swapchain image; the screen filter then
     // draws it behind the game screen quad, filling the margins around it
     vk::ImageView background_view = nullptr;
-    uint32_t background_width = 0;
-    uint32_t background_height = 0;
-    if (background_player.is_loaded() && screen_renderer.filter && screen_renderer.filter->supports_background()) {
+    if (background_player.is_loaded() && screen_renderer.filter) {
         const uint32_t image_idx = screen_renderer.swapchain_image_idx;
         // write the background quad outside the render pass first
         screen_renderer.filter->prepare_background();
@@ -1515,11 +1483,8 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
         });
 
         const vkutil::Image &background_surface = screen_renderer.background_surface[image_idx];
-        if (background_surface.view) {
+        if (background_surface.view)
             background_view = background_surface.view;
-            background_width = background_surface.width;
-            background_height = background_surface.height;
-        }
     }
 
     if (frame.base) {
@@ -1595,11 +1560,11 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
                 vk::DependencyFlags(), order_barrier, {}, {});
         }
 
-        screen_renderer.render(surface_handle, layout, viewport, background_view, background_width, background_height);
+        screen_renderer.render(surface_handle, layout, viewport, background_view);
     } else if (has_overlays) {
         screen_renderer.begin_default_render_pass();
         if (background_view)
-            screen_renderer.filter->render_background(background_view, background_width, background_height);
+            screen_renderer.filter->render_background(background_view, false);
     }
 
     if (has_overlays && screen_renderer.current_cmd_buffer) {

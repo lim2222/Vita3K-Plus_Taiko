@@ -556,14 +556,15 @@ void ScreenRenderer::begin_default_render_pass() {
 }
 
 void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, const Viewport &viewport,
-    vk::ImageView background_view, uint32_t background_width, uint32_t background_height) {
+    vk::ImageView background_view) {
     if (swapchain_image_idx == ~0 && !acquire_swapchain_image())
         return;
 
     // we need to apply the screen filter at the right moment (before or after we start the render pass depending on it)
     filter->render(true, image_view, layout, viewport);
 
-    const auto render_pass = filter->need_post_processing_render_pass() ? post_filter_render_pass : default_render_pass;
+    const bool post_processing = filter->need_post_processing_render_pass();
+    const auto render_pass = post_processing ? post_filter_render_pass : default_render_pass;
     vk::RenderPassBeginInfo pass_info{
         .renderPass = render_pass,
         .framebuffer = swapchain_framebuffers[swapchain_image_idx],
@@ -580,7 +581,7 @@ void ScreenRenderer::render(vk::ImageView image_view, vk::ImageLayout layout, co
     // the animation background draws first, the game screen covers it in the
     // middle and leaves the margins to it
     if (background_view)
-        filter->render_background(background_view, background_width, background_height);
+        filter->render_background(background_view, post_processing);
 
     filter->render(false, image_view, layout, viewport);
 
